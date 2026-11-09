@@ -18,6 +18,8 @@ export type AgentRow = {
   kind: string
   progress: string
   parent: string
+  // Workflows: how many of its agents failed
+  failed: number
 }
 
 export type FlowChild = { index: number; label: string; phase: string; model: string; status: string; id: string; note: string }

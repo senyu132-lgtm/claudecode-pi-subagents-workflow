@@ -1,0 +1,25 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  node:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: ['22', '24']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Syntax
+        shell: bash
+        run: for f in bin/*.mjs tests/fake-pi.mjs; do node --check "$f"; done
+      - name: Engine, schema and broker tests
+        shell: bash
+        run: node --test "tests/*.node-test.mjs"

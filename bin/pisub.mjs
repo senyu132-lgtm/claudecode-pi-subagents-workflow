@@ -4,7 +4,7 @@
 // Run directories live in ~/.pi-subagents/runs/<id>/ (set PI_SUBAGENTS_HOME to move the root).
 //
 // Usage (full help: `node pisub.mjs help`):
-//   spawn  [--model alias|provider/model] [--thinking lvl] [--cwd dir] [--readonly]
+//   spawn  [--model alias|provider/model] [--thinking lvl] [--cwd dir] [--readonly] [--worktree]
 //          [--name name] [--owner session-id] [--wait] [--timeout sec] [--json]
 //          (--task-file file | --stdin | task text...)
 //   send   <id> [--mode steer|follow_up] [--from claude|user] [--wait] (--stdin | text...)
@@ -17,6 +17,7 @@
 import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { checkScript, extractJSON, runFlow, validate } from './flow.mjs';
@@ -42,6 +43,11 @@ const DEFAULT_CONFIG = {
   overloadBackoffSec: [20, 40, 80, 160, 300, 300], // broker retries after pi's own retries give up
   flowConcurrency: { default: 4 }, // workflows: agents running at once, per model alias
   flowStaggerMs: {}, // workflows: minimum gap between agent starts, per model alias (ms)
+  maxAgents: 16, // pi agents running at once on this machine, across every session and workflow (0 = no limit)
+  rpcTimeoutSec: 60, // how long to wait for pi to answer a command before treating it as hung
+  stallTimeoutMin: 20, // a working agent that sends nothing for this long (no tool running) is stopped as hung (0 = off)
+  toolTimeoutMin: 120, // a single tool call that runs longer than this is treated as hung (0 = off)
+  keepRunsDays: 30, // finished runs older than this are deleted automatically (0 = keep forever)
 };
 
 // ---------- helpers ----------
@@ -52,19 +58,75 @@ function die(msg, code = 1) {
   process.stderr.write(`pisub: ${msg}\n`);
   process.exit(code);
 }
-function readJSON(file, fallback) {
+// A missing file gives the fallback. With strict, a file that exists but cannot be read or parsed throws
+// instead of being taken for "empty", so a broken config is reported rather than silently ignored.
+function readJSON(file, fallback, strict = false) {
+  let text;
   try {
-    return JSON.parse(fs.readFileSync(file, 'utf8'));
-  } catch {
-    return fallback;
+    text = fs.readFileSync(file, 'utf8');
+  } catch (e) {
+    if (!strict || e.code === 'ENOENT') return fallback;
+    throw e;
+  }
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    if (!strict) return fallback;
+    throw new Error(L(`${file} is not valid JSON: ${e.message}`, `${file} 不是合法的 JSON：${e.message}`));
   }
 }
 function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
+// Runs hold tasks, transcripts and tool output: keep them readable by this user only (no effect on Windows,
+// where the user profile folder is already private)
+const DIR_MODE = 0o700;
+const FILE_MODE = 0o600;
+const mkdirp = dir => fs.mkdirSync(dir, { recursive: true, mode: DIR_MODE });
+const writePrivate = (file, data) => fs.writeFileSync(file, data, { mode: FILE_MODE });
+const appendPrivate = (file, data) => fs.appendFileSync(file, data, { mode: FILE_MODE });
+// Cross-process lock for a read-modify-write of a shared file: an exclusive "<file>.lock". A holder that
+// died or hung for staleMs loses it, so a crash never blocks everyone else for good.
+function withFileLock(file, fn, staleMs = 10000) {
+  const lock = `${file}.lock`;
+  const t0 = now();
+  for (;;) {
+    try {
+      fs.writeFileSync(lock, `${process.pid} ${now()}`, { flag: 'wx', mode: FILE_MODE });
+      break;
+    } catch (e) {
+      if (e.code !== 'EEXIST' && e.code !== 'EPERM') throw e;
+      let age = 0;
+      try {
+        age = now() - fs.statSync(lock).mtimeMs;
+      } catch {
+        continue;
+      }
+      if (age > staleMs || now() - t0 > staleMs * 2) try { fs.unlinkSync(lock); } catch {}
+      else sleepSync(5 + Math.floor(Math.random() * 20));
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    try { fs.unlinkSync(lock); } catch {}
+  }
+}
+// Kill a process and everything it started (pi's shell commands, sh() children)
+function killTree(pid) {
+  if (!pid) return;
+  if (process.platform === 'win32') spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+  else {
+    try {
+      process.kill(-pid, 'SIGKILL'); // its process group (children are started detached, as group leaders)
+    } catch {
+      try { process.kill(pid, 'SIGKILL'); } catch {}
+    }
+  }
+}
 function writeJSON(file, data) {
   const tmp = `${file}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2), { mode: FILE_MODE });
   for (let i = 0; ; i++) {
     try {
       fs.renameSync(tmp, file);
@@ -84,7 +146,12 @@ function trunc(s, n) {
   return s.length > n ? s.slice(0, n) + L(`… (${s.length} chars, truncated)`, `…（共 ${s.length} 字，已截断）`) : s;
 }
 function loadConfig() {
-  const user = readJSON(CONFIG_FILE, {}) || {};
+  let user;
+  try {
+    user = readJSON(CONFIG_FILE, {}, true) || {};
+  } catch (e) {
+    die(L(`cannot use the config file: ${e.message}`, `配置文件有问题：${e.message}`));
+  }
   return {
     ...DEFAULT_CONFIG,
     ...user,
@@ -96,10 +163,12 @@ function loadConfig() {
 setLanguage(process.env.PISUB_LANG || loadConfig().language);
 
 // Sent to pi after the broker recovered from a usage limit or an overload
+// The tool calls made before the interruption already happened: the notice asks the model to check before
+// repeating anything that changes files or outside systems (exactly-once is not something we can promise).
 const continueText = () =>
   L(
-    '(System notice: the previous request was interrupted by a usage limit or a service overload and has now recovered. Continue the original task from where it stopped; do not redo finished parts.)',
-    '（系统通知：刚才的请求因额度用尽或服务过载而中断，现已恢复。请从中断处继续完成原任务，不要重复已经完成的部分。）'
+    '(System notice: the previous request was interrupted by a usage limit or a service overload and has now recovered. Continue the original task from where it stopped. Steps you already ran did take effect: before repeating anything that writes files, runs commands with side effects or calls outside services, check whether it was already done, and do not do it twice.)',
+    '（系统通知：刚才的请求因额度用尽或服务过载而中断，现已恢复。请从中断处继续完成原任务。中断前执行过的步骤已经生效：凡是写文件、执行有副作用的命令、调用外部服务的操作，重做之前先检查是否已经做过，不要做两遍。）'
   );
 
 // ---------- locating pi ----------
@@ -172,17 +241,38 @@ const runDir = id => path.join(RUNS, id);
 const statePath = id => path.join(runDir(id), 'state.json');
 const inboxDir = id => path.join(runDir(id), 'inbox');
 const readState = id => readJSON(statePath(id), null);
+// Several processes write state.json (the broker, a workflow runner, stop/wait commands): every update is a
+// locked read-modify-write, carries a version number, and the round counter never goes backwards.
 function saveState(id, patch) {
-  const st = { ...readState(id), ...patch, updatedAt: now() };
-  writeJSON(statePath(id), st);
-  return st;
+  return withFileLock(statePath(id), () => {
+    const cur = readState(id) || {};
+    const st = { ...cur, ...patch, updatedAt: now(), version: (cur.version || 0) + 1 };
+    if ((cur.rounds || 0) > (st.rounds || 0)) st.rounds = cur.rounds;
+    writeJSON(statePath(id), st);
+    return st;
+  });
 }
 function makeId(alias) {
   const t = new Date();
   const p2 = n => String(n).padStart(2, '0');
   const stamp = `${p2(t.getMonth() + 1)}${p2(t.getDate())}-${p2(t.getHours())}${p2(t.getMinutes())}${p2(t.getSeconds())}`;
   const safe = String(alias).replace(/[^\w.-]/g, '').slice(0, 24) || 'pi';
-  return `${safe}-${stamp}-${Math.random().toString(36).slice(2, 5)}`;
+  return `${safe}-${stamp}-${crypto.randomBytes(4).toString('hex')}`;
+}
+// A new run directory under a fresh id. Created exclusively, so two runs can never share a folder.
+function newRunDir(alias) {
+  mkdirp(RUNS);
+  for (;;) {
+    const id = makeId(alias);
+    try {
+      fs.mkdirSync(runDir(id), { mode: DIR_MODE });
+    } catch (e) {
+      if (e.code === 'EEXIST') continue;
+      throw e;
+    }
+    mkdirp(inboxDir(id));
+    return id;
+  }
 }
 function inboxFiles(id) {
   try {
@@ -192,25 +282,49 @@ function inboxFiles(id) {
   }
 }
 const hasInbox = id => inboxFiles(id).length > 0;
+// Messages are files named so that they sort in sending order: time, then a counter for messages this process
+// sent within the same millisecond. A message stays in the inbox until pi has accepted it (see deliver()).
+let enqueueSeq = 0;
 function enqueue(id, msg) {
-  fs.mkdirSync(inboxDir(id), { recursive: true });
-  const name = `${now()}-${process.pid}-${Math.random().toString(36).slice(2, 6)}`;
+  mkdirp(inboxDir(id));
+  const name = `${String(now()).padStart(14, '0')}-${String(++enqueueSeq).padStart(6, '0')}-${process.pid}`;
   const tmp = path.join(inboxDir(id), name + '.tmp');
-  fs.writeFileSync(tmp, JSON.stringify({ ...msg, at: now() }));
+  writePrivate(tmp, JSON.stringify({ ...msg, at: now() }));
   fs.renameSync(tmp, path.join(inboxDir(id), name + '.json'));
 }
 
 // ---------- lock: one broker per agent ----------
+// The holder rewrites its lock every few seconds. A lock whose process is gone, or whose heartbeat stopped
+// (the process hung, or the pid now belongs to some other program), no longer counts.
 const lockPath = id => path.join(runDir(id), 'serve.lock');
+const HEARTBEAT_MS = 5000;
+const LOCK_STALE_MS = 60000;
+const LOCK_TOKEN = `${process.pid}-${crypto.randomBytes(6).toString('hex')}`;
 function lockHolder(id) {
-  const pid = Number(readJSON(lockPath(id), {})?.pid);
-  return isAlive(pid) ? pid : null;
+  const l = readJSON(lockPath(id), null);
+  const pid = Number(l?.pid);
+  return isAlive(pid) && now() - Number(l.at || 0) < LOCK_STALE_MS ? pid : null;
 }
 const isServing = id => lockHolder(id) !== null;
+const heartbeats = new Map();
 function acquireLock(id) {
   for (let i = 0; i < 2; i++) {
     try {
-      fs.writeFileSync(lockPath(id), JSON.stringify({ pid: process.pid, at: now() }), { flag: 'wx' });
+      fs.writeFileSync(lockPath(id), JSON.stringify({ pid: process.pid, at: now(), token: LOCK_TOKEN }), { flag: 'wx', mode: FILE_MODE });
+      heartbeats.set(
+        id,
+        setInterval(() => {
+          // Someone took the lock over (we were hung long enough to look dead): stop at once, never run twice
+          const cur = readJSON(lockPath(id), null);
+          if (cur?.token && cur.token !== LOCK_TOKEN) {
+            process.stderr.write(`pisub: lost the lock of ${id}; exiting\n`);
+            process.exit(3);
+          }
+          try { writeJSON(lockPath(id), { pid: process.pid, at: now(), token: LOCK_TOKEN }); } catch {}
+          beatSlot();
+        }, HEARTBEAT_MS)
+      );
+      heartbeats.get(id).unref();
       return true;
     } catch (e) {
       if (e.code !== 'EEXIST') throw e;
@@ -222,10 +336,57 @@ function acquireLock(id) {
   return false;
 }
 function releaseLock(id) {
-  if (Number(readJSON(lockPath(id), {})?.pid) === process.pid) {
+  clearInterval(heartbeats.get(id));
+  heartbeats.delete(id);
+  if (readJSON(lockPath(id), {})?.token === LOCK_TOKEN) {
     try { fs.unlinkSync(lockPath(id)); } catch {}
   }
 }
+
+// ---------- global limit: pi agents running at once on this machine ----------
+// One slot file per running pi process, under ~/.pi-subagents/slots. A slot whose owner died or stopped
+// beating is free again. maxAgents = 0 turns the limit off.
+const SLOTS = path.join(HOME, 'slots');
+let mySlot = null;
+function slotFree(file) {
+  const s = readJSON(file, null);
+  return !s || !isAlive(Number(s.pid)) || now() - Number(s.at || 0) > LOCK_STALE_MS;
+}
+function tryTakeSlot(max, id) {
+  mkdirp(SLOTS);
+  for (let i = 0; i < max; i++) {
+    const file = path.join(SLOTS, `slot-${i}.json`);
+    const body = JSON.stringify({ pid: process.pid, id, at: now(), token: LOCK_TOKEN });
+    try {
+      fs.writeFileSync(file, body, { flag: 'wx', mode: FILE_MODE });
+      return file;
+    } catch (e) {
+      if (e.code !== 'EEXIST') continue;
+      // Take over a dead slot under a lock, so two waiters cannot both take it
+      const took = withFileLock(file, () => {
+        if (!slotFree(file)) return false;
+        writeJSON(file, JSON.parse(body));
+        return true;
+      });
+      if (took) return file;
+    }
+  }
+  return null;
+}
+function beatSlot() {
+  if (mySlot && readJSON(mySlot, {})?.token === LOCK_TOKEN) try { writeJSON(mySlot, { ...readJSON(mySlot, {}), at: now() }); } catch {}
+}
+function releaseSlot() {
+  if (mySlot && readJSON(mySlot, {})?.token === LOCK_TOKEN) try { fs.unlinkSync(mySlot); } catch {}
+  mySlot = null;
+}
+const runningSlots = () => {
+  try {
+    return fs.readdirSync(SLOTS).filter(f => f.endsWith('.json') && !slotFree(path.join(SLOTS, f))).length;
+  } catch {
+    return 0;
+  }
+};
 function launchServe(id) {
   const st = readState(id);
   if (st?.kind === 'flow' && st.status !== 'starting') {
@@ -238,12 +399,17 @@ function launchServe(id) {
     }
     return;
   }
-  const log = fs.openSync(path.join(runDir(id), 'serve.log'), 'a');
-  const child = spawn(process.execPath, [SELF, st?.kind === 'flow' ? '_flow' : '_serve', id], {
+  const log = fs.openSync(path.join(runDir(id), 'serve.log'), 'a', FILE_MODE);
+  // A workflow script runs in its runner: cap its memory so a runaway script cannot take the machine down
+  const nodeArgs = st?.kind === 'flow' ? ['--max-old-space-size=2048'] : [];
+  const child = spawn(process.execPath, [...nodeArgs, SELF, st?.kind === 'flow' ? '_flow' : '_serve', id], {
     detached: true,
     stdio: ['ignore', log, log],
     windowsHide: true,
     cwd: runDir(id),
+  });
+  child.on('error', e => {
+    try { saveState(id, { status: 'error', lastError: L(`could not start the background process: ${e.message}`, `后台进程启动失败：${e.message}`), rounds: (readState(id)?.rounds || 0) + 1, finishedAt: now() }); } catch {}
   });
   child.unref();
   fs.closeSync(log);
@@ -253,7 +419,17 @@ function ensureServing(id) {
 }
 
 // ---------- models and provider pools ----------
-const loadCooldowns = () => readJSON(ACCOUNTS_FILE, {});
+function loadCooldowns() {
+  try {
+    return readJSON(ACCOUNTS_FILE, {}, true) || {};
+  } catch (e) {
+    // Do not lose it silently: keep the broken file aside and say so
+    const keep = `${ACCOUNTS_FILE}.broken-${now()}`;
+    try { fs.renameSync(ACCOUNTS_FILE, keep); } catch {}
+    process.stderr.write(`pisub: ${e.message}; moved it to ${keep} and started with no cooldowns\n`);
+    return {};
+  }
+}
 function providerAvailable(p, acc = loadCooldowns()) {
   const a = acc[p];
   return !a || !a.until || a.until <= now();
@@ -263,10 +439,12 @@ function pickProvider(pool, exclude = []) {
   return pool.find(p => !exclude.includes(p) && providerAvailable(p, acc)) || null;
 }
 function markExhausted(p, minutes, reason) {
-  fs.mkdirSync(HOME, { recursive: true });
-  const acc = loadCooldowns();
-  acc[p] = { until: now() + minutes * 60000, at: now(), reason: trunc(reason, 300) };
-  writeJSON(ACCOUNTS_FILE, acc);
+  mkdirp(HOME);
+  withFileLock(ACCOUNTS_FILE, () => {
+    const acc = loadCooldowns();
+    acc[p] = { until: now() + minutes * 60000, at: now(), reason: trunc(reason, 300) };
+    writeJSON(ACCOUNTS_FILE, acc);
+  });
 }
 const allPoolProviders = cfg => [...new Set(Object.values(cfg.aliases).flatMap(a => (Array.isArray(a?.providers) ? a.providers : [])))];
 function aliasInfo(name, a) {
@@ -298,6 +476,204 @@ const isTransient = e =>
 function minutesFrom(e) {
   const m = /try again in ~?\s*(\d+)\s*min/i.exec(e || '');
   return m ? Math.max(1, Number(m[1])) : null;
+}
+
+// ---------- git ----------
+function git(cwd, args, { input, raw } = {}) {
+  const r = spawnSync('git', args, { cwd, input, windowsHide: true, maxBuffer: 512 * 1024 * 1024, encoding: raw ? 'buffer' : 'utf8' });
+  return { ok: r.status === 0, out: r.stdout ?? (raw ? Buffer.alloc(0) : ''), err: String(r.stderr || r.error?.message || '').trim() };
+}
+const gitOut = (cwd, args) => {
+  const r = git(cwd, args);
+  return r.ok ? r.out.trim() : null;
+};
+// Commits made for you use your git identity if you have one. Hooks and signing are skipped: nobody is
+// there to type a passphrase, and a slow pre-commit hook should not hold up an agent.
+function gitCommit(cwd, message) {
+  const named = gitOut(cwd, ['config', 'user.email']);
+  const who = named ? [] : ['-c', 'user.name=pi-subagents', '-c', 'user.email=pi-subagents@localhost'];
+  return git(cwd, [...who, '-c', 'commit.gpgsign=false', 'commit', '-q', '--no-verify', '-m', message]);
+}
+
+// What the repository around cwd looks like now: HEAD plus a hash of every uncommitted change (path, status,
+// size, modification time). Cheap, and writes nothing. null outside a repository.
+function gitSignature(cwd) {
+  const root = gitOut(cwd, ['rev-parse', '--show-toplevel']);
+  if (!root) return null;
+  const head = gitOut(root, ['rev-parse', '-q', '--verify', 'HEAD']) || '';
+  const st = git(root, ['--no-optional-locks', '-c', 'core.quotePath=false', 'status', '--porcelain=v1', '-z', '--untracked-files=all']);
+  if (!st.ok) return null;
+  const h = crypto.createHash('sha1');
+  const entries = st.out.split('\0').filter(Boolean);
+  for (const e of entries) {
+    let f = 'x';
+    try {
+      const s = fs.statSync(path.join(root, e.slice(3)));
+      f = `${s.size}:${Math.round(s.mtimeMs)}`;
+    } catch {}
+    h.update(`${e}\0${f}\n`);
+  }
+  return { root, head, dirty: entries.length, sig: h.digest('hex').slice(0, 16) };
+}
+
+// ---------- workflow inputs: fingerprint of the files an agent reads ----------
+const SKIP_DIRS = new Set(['.git', 'node_modules', '.venv', 'venv', '__pycache__']);
+const HASH_FULL_MAX = 64 * 1024 * 1024; // bigger files are fingerprinted by size and modification time
+function hashInputs(paths, cwd) {
+  const h = crypto.createHash('sha1');
+  let files = 0;
+  const walk = (abs, rel) => {
+    let s;
+    try {
+      s = fs.lstatSync(abs);
+    } catch {
+      return h.update(`missing ${rel}\n`);
+    }
+    if (s.isSymbolicLink()) return h.update(`link ${rel} ${fs.readlinkSync(abs)}\n`);
+    if (s.isDirectory()) {
+      h.update(`dir ${rel}\n`);
+      for (const name of fs.readdirSync(abs).sort()) if (!SKIP_DIRS.has(name)) walk(path.join(abs, name), `${rel}/${name}`);
+      return;
+    }
+    if (!s.isFile()) return;
+    if (++files > 100000) throw new Error(L(`inputs cover more than 100000 files; name narrower paths`, `inputs 涵盖的文件超过 100000 个，请写得更具体`));
+    h.update(`file ${rel} ${s.size}\n`);
+    if (s.size > HASH_FULL_MAX) h.update(`mtime ${Math.round(s.mtimeMs)}\n`);
+    else h.update(fs.readFileSync(abs));
+  };
+  for (const p of paths) walk(path.resolve(cwd, p), p.replace(/\\/g, '/'));
+  return h.digest('hex').slice(0, 16);
+}
+
+// ---------- worktrees: agents that change files without touching yours ----------
+const MAX_UNTRACKED = 50 * 1024 * 1024; // untracked files bigger than this are not copied into a worktree
+
+// A new branch pi/<id> checked out under the agent's run directory. It starts from HEAD plus your
+// uncommitted changes (edits to tracked files and untracked, non-ignored files), committed on the branch as
+// a "snapshot" commit, so the agent sees what you see. Ignored files (node_modules, build output, ignored
+// data) are not there. Throws when it cannot be done.
+function createWorktree(id, cwd) {
+  const root = gitOut(cwd, ['rev-parse', '--show-toplevel']);
+  if (!root) throw new Error(L(`isolation "worktree" needs a working directory inside a git repository (${cwd} is not)`, `isolation "worktree" 要求工作目录在 git 仓库里（${cwd} 不是）`));
+  const head = gitOut(root, ['rev-parse', '-q', '--verify', 'HEAD']);
+  if (!head) throw new Error(L('isolation "worktree" needs a repository with at least one commit', 'isolation "worktree" 要求仓库里至少有一次提交'));
+  const prefix = gitOut(cwd, ['rev-parse', '--show-prefix']) || '';
+  const dir = path.join(runDir(id), 'wt');
+  const branch = `pi/${id}`;
+  let r;
+  for (let i = 0; i < 4; i++) {
+    r = git(root, ['worktree', 'add', '-q', '-b', branch, dir, head]);
+    if (r.ok) break;
+    // Another agent may be holding a git lock: clean up the half-made attempt and try again
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+    git(root, ['worktree', 'prune']);
+    git(root, ['branch', '-q', '-D', branch]);
+    sleepSync(300 * (i + 1));
+  }
+  if (!r.ok) throw new Error(L(`could not create a git worktree: ${r.err}`, `创建 git worktree 失败：${r.err}`));
+
+  const notes = [];
+  let staged = false;
+  // Edits to tracked files: applied to the index (in git's own line endings), checked out below
+  const diff = git(root, ['diff', 'HEAD', '--binary', '--no-color', '--no-ext-diff'], { raw: true });
+  if (diff.ok && diff.out.length) {
+    const a = git(dir, ['apply', '--cached', '--binary', '--whitespace=nowarn'], { input: diff.out });
+    if (a.ok) staged = true;
+    else notes.push(L(`your uncommitted edits to tracked files could not be copied in (${trunc(a.err, 200)})`, `你对已跟踪文件的未提交修改没能复制进来（${trunc(a.err, 200)}）`));
+  }
+  // Untracked, non-ignored files: copied as they are
+  const list = git(root, ['-c', 'core.quotePath=false', 'ls-files', '-o', '--exclude-standard', '-z']);
+  const copied = [];
+  const skipped = [];
+  for (const rel of list.ok ? list.out.split('\0').filter(Boolean) : []) {
+    try {
+      const src = path.join(root, rel);
+      const s = fs.statSync(src);
+      if (!s.isFile()) continue;
+      if (s.size > MAX_UNTRACKED) {
+        skipped.push(rel);
+        continue;
+      }
+      fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
+      fs.copyFileSync(src, path.join(dir, rel));
+      copied.push(rel);
+    } catch {}
+  }
+  if (copied.length) {
+    const a = git(dir, ['add', '--pathspec-from-file=-', '--pathspec-file-nul'], { input: copied.join('\0') });
+    if (a.ok) staged = true;
+  }
+  if (skipped.length)
+    notes.push(L(`untracked files over 50 MB were not copied in: ${skipped.slice(0, 5).join(', ')}${skipped.length > 5 ? ' …' : ''}`, `超过 50 MB 的未跟踪文件没有复制进来：${skipped.slice(0, 5).join('、')}${skipped.length > 5 ? ' …' : ''}`));
+  let base = head;
+  if (staged && !git(dir, ['diff', '--cached', '--quiet']).ok) {
+    const c = gitCommit(dir, 'pi-subagents: snapshot of uncommitted changes');
+    if (c.ok) {
+      base = gitOut(dir, ['rev-parse', 'HEAD']) || head;
+      git(dir, ['reset', '-q', '--hard']);
+    } else notes.push(L(`your uncommitted changes could not be committed in the worktree (${trunc(c.err, 200)})`, `未提交的修改没能在 worktree 里提交（${trunc(c.err, 200)}）`));
+  }
+  return { root, dir, branch, head, base, prefix, notes };
+}
+// Before a round: bring back a worktree removed after an earlier round. Returns an error message or ''.
+function ensureWorktree(w) {
+  if (fs.existsSync(w.dir)) return '';
+  git(w.root, ['worktree', 'prune']);
+  const has = git(w.root, ['rev-parse', '-q', '--verify', `refs/heads/${w.branch}`]).ok;
+  let r = git(w.root, has ? ['worktree', 'add', '-q', w.dir, w.branch] : ['worktree', 'add', '-q', '-b', w.branch, w.dir, w.base]);
+  // A snapshot commit nothing points to any more may have been garbage-collected: start from HEAD then
+  if (!r.ok && !has) r = git(w.root, ['worktree', 'add', '-q', '-b', w.branch, w.dir, w.head]);
+  return r.ok ? '' : r.err;
+}
+// After a round: commit what the agent changed on its branch. Returns { changed, stat, error? } or null.
+function commitWorktree(st) {
+  const w = st.worktree;
+  if (!w || !fs.existsSync(w.dir)) return null;
+  git(w.dir, ['add', '-A']);
+  let error = '';
+  if (!git(w.dir, ['diff', '--cached', '--quiet']).ok) {
+    const c = gitCommit(w.dir, `pi-subagents: ${st.name || st.id} (round ${(st.rounds || 0) + 1})`);
+    if (!c.ok) error = c.err;
+  }
+  const stat = gitOut(w.root, ['diff', '--shortstat', w.base, w.branch]) || '';
+  return { changed: !!stat || !!error, stat, ...(error ? { error: trunc(error, 300) } : {}) };
+}
+function removeWorktree(w) {
+  if (!git(w.root, ['worktree', 'remove', '--force', w.dir]).ok) {
+    try { fs.rmSync(w.dir, { recursive: true, force: true }); } catch {}
+    git(w.root, ['worktree', 'prune']);
+  }
+  git(w.root, ['branch', '-q', '-D', w.branch]);
+}
+// Tells the agent where it is working. Prepended to its first task.
+function worktreeIntro(w) {
+  const here = path.join(w.dir, w.prefix || '');
+  return (
+    L(
+      `(Isolation: you are working in your own git worktree, ${here}, a copy of the repository ${w.root} on branch ${w.branch}. Make every change inside this worktree: when the task names a path under ${w.root}, use the same relative path under ${w.dir}. Do not commit; your changes are committed for review when you finish.`,
+      `（隔离说明：你在自己的 git worktree 里工作，目录 ${here}，它是仓库 ${w.root} 的一份拷贝，分支 ${w.branch}。所有修改都在这个 worktree 里做：任务里提到 ${w.root} 下的路径时，改用 ${w.dir} 下相同的相对路径。不要自己提交，你做完后改动会自动提交，供人审查。`
+    ) +
+    (w.notes.length ? ' ' + L('Note: ', '注意：') + w.notes.join(L('; ', '；')) : '') +
+    L(')\n\n', '）\n\n')
+  );
+}
+// What happened to an agent's worktree, for its final answer and the notification
+function worktreeReport(w, rep, id) {
+  if (!w || !rep) return '';
+  w = { ...w, id };
+  if (!rep.changed) return L(`(No files were changed, so the worktree and branch ${w.branch} were removed.)`, `（没有改动文件，worktree 和分支 ${w.branch} 已删除。）`);
+  const q = `git -C "${w.root}"`;
+  const base = w.base.slice(0, 12);
+  return L(
+    `Changes are committed on branch ${w.branch}${rep.stat ? ` (${rep.stat})` : ''}${rep.error ? `, but the last commit failed: ${rep.error}` : ''}. Worktree: ${w.dir}\n` +
+      `  review:  ${q} diff ${base} ${w.branch}\n` +
+      `  apply to your working tree:  pisub apply ${w.id}   (check first: pisub apply ${w.id} --check)\n` +
+      `  clean up afterwards:  pisub clean ${w.id} --branches`,
+    `改动已提交到分支 ${w.branch}${rep.stat ? `（${rep.stat}）` : ''}${rep.error ? `，但最后一次提交失败：${rep.error}` : ''}。worktree：${w.dir}\n` +
+      `  查看：  ${q} diff ${base} ${w.branch}\n` +
+      `  应用到你的工作区：  pisub apply ${w.id}   （先检查：pisub apply ${w.id} --check）\n` +
+      `  用完清理：  pisub clean ${w.id} --branches`
+  );
 }
 
 // ---------- arguments ----------
@@ -332,7 +708,9 @@ async function getText(o) {
 // ---------- commands ----------
 // Create an agent's run directory and queue its first task (does not start the broker). Throws on error.
 // extra: additional state.json fields (workflow children carry parent, phase and label)
-function createRun({ task, model, thinking, cwd, readonly, name, owner, origin, from, extra }) {
+function createRun({ task, model, thinking, cwd, readonly, name, owner, origin, from, extra, isolation }) {
+  if (isolation && isolation !== 'worktree' && isolation !== 'none')
+    throw new Error(L(`unknown isolation "${isolation}" (only "worktree" is supported)`, `不认识的 isolation「${isolation}」（只支持 "worktree"）`));
   const cfg = loadConfig();
   const m = resolveModel(model, cfg);
   let provider = m.provider;
@@ -348,9 +726,19 @@ function createRun({ task, model, thinking, cwd, readonly, name, owner, origin, 
   }
   cwd = path.resolve(cwd || process.cwd());
   if (!fs.existsSync(cwd)) throw new Error(L(`working directory does not exist: ${cwd}`, `工作目录不存在：${cwd}`));
-  const id = makeId(name || m.alias);
-  fs.mkdirSync(inboxDir(id), { recursive: true });
-  fs.writeFileSync(path.join(runDir(id), 'task.md'), task);
+  const id = newRunDir(name || m.alias);
+  // A read-only agent cannot change anything, so it needs no worktree
+  let worktree = null;
+  if (isolation === 'worktree' && !readonly) {
+    try {
+      worktree = createWorktree(id, cwd);
+    } catch (e) {
+      try { fs.rmSync(runDir(id), { recursive: true, force: true }); } catch {}
+      throw e;
+    }
+    task = worktreeIntro(worktree) + task;
+  }
+  writePrivate(path.join(runDir(id), 'task.md'), task);
   writeJSON(statePath(id), {
     id,
     name: name || '',
@@ -369,6 +757,7 @@ function createRun({ task, model, thinking, cwd, readonly, name, owner, origin, 
     updatedAt: now(),
     rounds: 0,
     accountsTried: provider && m.pool.length ? [provider] : [],
+    ...(worktree ? { worktree } : {}),
     ...(extra || {}),
   });
   enqueue(id, { text: task, from: from || 'claude', mode: 'prompt' });
@@ -376,12 +765,12 @@ function createRun({ task, model, thinking, cwd, readonly, name, owner, origin, 
 }
 
 async function cmdSpawn(argv) {
-  const o = parseArgs(argv, ['readonly', 'wait', 'json', 'stdin']);
+  const o = parseArgs(argv, ['readonly', 'wait', 'json', 'stdin', 'worktree']);
   const task = await getText(o);
   if (!task.trim()) die(L('no task given (use --task-file, --stdin, or write it after the options)', '没有任务描述（用 --task-file、--stdin 或直接写在后面）'));
   let r;
   try {
-    r = createRun({ task, model: o.model, thinking: o.thinking, cwd: o.cwd, readonly: o.readonly, name: o.name, owner: o.owner, origin: o.origin, from: o.from });
+    r = createRun({ task, model: o.model, thinking: o.thinking, cwd: o.cwd, readonly: o.readonly, name: o.name, owner: o.owner, origin: o.origin, from: o.from, isolation: o.worktree ? 'worktree' : o.isolation });
   } catch (e) {
     die(e.message);
   }
@@ -431,6 +820,7 @@ function ago(t) {
 }
 const STATUS_NAMES = {
   starting: ['starting', '启动中'],
+  queued: ['waiting for a slot', '排队中'],
   running: ['running', '运行中'],
   retrying: ['retrying', '重试中'],
   waiting: ['waiting to retry', '等待重试'],
@@ -439,16 +829,36 @@ const STATUS_NAMES = {
   stopped: ['stopped', '已停止'],
 };
 const statusName = s => (STATUS_NAMES[s] ? L(...STATUS_NAMES[s]) : s);
-function liveStatus(st) {
-  // If the broker died unexpectedly the state stays "running" forever
-  if (!TERMINAL.has(st.status) && !isServing(st.id) && now() - st.updatedAt > 15000) return 'error';
-  return st.status;
+// A broker that died (crash, killed, machine shut down) leaves its run "running" in state.json for good
+const isLost = st => !TERMINAL.has(st.status) && !isServing(st.id) && now() - (st.updatedAt || 0) > 15000;
+// Settle a lost run, once, for whoever looks first (status, wait, the pane): restart it when messages are
+// waiting, otherwise record the failure with a final answer, so the side waiting for it gets notified.
+function reconcile(st) {
+  if (!st || !isLost(st)) return st;
+  if (st.kind !== 'flow' && hasInbox(st.id)) {
+    launchServe(st.id);
+    return { ...st, status: 'starting' };
+  }
+  return withFileLock(path.join(runDir(st.id), 'reconcile'), () => {
+    const cur = readState(st.id);
+    if (!cur || !isLost(cur)) return cur;
+    const flow = cur.kind === 'flow';
+    if (flow) stopChildren(cur.id);
+    const msg = flow
+      ? L('the workflow runner process is gone (see serve.log); its agents were stopped', '工作流执行进程已不在（见 serve.log），它的代理已停止')
+      : L('the broker process exited unexpectedly (see serve.log and pi-stderr.log)', 'broker 进程意外退出（见 serve.log 和 pi-stderr.log）');
+    const round = (cur.rounds || 0) + 1;
+    try {
+      writePrivate(path.join(runDir(cur.id), 'final.md'), `${errorTitle()}${msg}\n`);
+      appendPrivate(path.join(runDir(cur.id), 'view.jsonl'), JSON.stringify({ t: now(), k: 'error', text: msg }) + '\n' + JSON.stringify({ t: now(), k: 'done', status: 'error', round }) + '\n');
+    } catch {}
+    return saveState(cur.id, { status: 'error', lastError: msg, finishedAt: now(), rounds: round });
+  });
 }
 function cmdStatus(argv) {
   const o = parseArgs(argv, ['json', 'all']);
   const id = o._[0];
-  const list = id ? [readState(checkId(id))] : listStates(o.owner).slice(0, Number(o.limit) || 30);
-  for (const st of list) st.status = liveStatus(st);
+  const list = (id ? [readState(checkId(id))] : listStates(o.owner).slice(0, Number(o.limit) || 30)).map(reconcile);
   if (o.json) return out(JSON.stringify(id ? list[0] : list));
   if (!list.length) return out(L('(no pi sub-agents)', '（没有 pi 子代理）'));
   for (const st of list) {
@@ -466,6 +876,7 @@ function cmdStatus(argv) {
     }
     out(`${st.id}  ${statusName(st.status)}  ${modelLabel(st)}  ${ago(st.createdAt)}  ${L(`round ${st.rounds}`, `第${st.rounds}轮`)}  ${trunc(st.task.replace(/\s+/g, ' '), 60)}`);
     if (st.lastError && st.status === 'error') out(`    ${L('error', '错误')}: ${trunc(st.lastError, 200)}`);
+    if (st.worktree?.report?.changed) out(`    ${L('branch', '分支')}: ${st.worktree.branch} ${st.worktree.report.stat ? `(${st.worktree.report.stat})` : ''}`);
   }
 }
 
@@ -523,8 +934,9 @@ async function waitFor(id, before, timeoutSec) {
   for (;;) {
     const st = readState(id);
     if (st && st.rounds > before && TERMINAL.has(st.status) && !hasInbox(id)) return st;
-    if (st && liveStatus(st) === 'error' && !TERMINAL.has(st.status) && !hasInbox(id)) {
-      return saveState(id, { status: 'error', lastError: L('the broker process exited unexpectedly (see serve.log)', 'broker 进程意外退出（见 serve.log）'), rounds: (st.rounds || 0) + 1 });
+    if (st && isLost(st)) {
+      const r = reconcile(st);
+      if (r && TERMINAL.has(r.status) && !hasInbox(id)) return r;
     }
     if (timeoutSec && now() - t0 > timeoutSec * 1000) return null;
     // Messages waiting but no broker (e.g. it just exited): start one
@@ -563,12 +975,36 @@ function stopChildren(id) {
     }
   }
 }
-function cmdStop(argv) {
+async function cmdStop(argv) {
   const id = checkId(argv[0]);
   // Workflow: if its runner is alive it winds down by itself; if the runner is gone, stop the agents here
   if (readState(id).kind === 'flow' && !isServing(id)) stopChildren(id);
   if (isServing(id)) {
     enqueue(id, { control: 'stop' });
+    // Watchdog: a process stuck in a busy loop (say, a workflow script with an endless loop) never reads its
+    // inbox and stops beating. If its heartbeat goes stale before it stops, kill it and clean up here.
+    const pid = lockHolder(id);
+    const t0 = now();
+    let hung = false;
+    while (now() - t0 < 60000) {
+      const st = readState(id);
+      if (TERMINAL.has(st.status) || !isAlive(pid)) break;
+      if (now() - Number(readJSON(lockPath(id), {})?.at || 0) > 3 * HEARTBEAT_MS) {
+        hung = true;
+        break;
+      }
+      await sleep(500);
+    }
+    if (hung) {
+      killTree(pid);
+      const piPid = Number(readState(id).piPid);
+      if (isAlive(piPid)) killTree(piPid);
+      try { fs.unlinkSync(lockPath(id)); } catch {}
+      if (readState(id).kind === 'flow') stopChildren(id);
+      const st = readState(id);
+      saveState(id, { status: 'stopped', rounds: (st.rounds || 0) + 1, finishedAt: now(), lastError: L('it did not respond, so its process was killed', '它没有响应，进程已被强制结束') });
+      return out(L(`${id} did not respond; its process was killed`, `${id} 没有响应，已强制结束进程`));
+    }
     out(L(`Stop requested for ${id}`, `已请求停止 ${id}`));
   } else {
     for (const f of inboxFiles(id)) try { fs.unlinkSync(path.join(inboxDir(id), f)); } catch {}
@@ -583,7 +1019,7 @@ function cmdAccounts(argv) {
     const acc = loadCooldowns();
     if (argv[1]) delete acc[argv[1]];
     else for (const k of Object.keys(acc)) delete acc[k];
-    fs.mkdirSync(HOME, { recursive: true });
+    mkdirp(HOME);
     writeJSON(ACCOUNTS_FILE, acc);
     return out(L('Reset.', '已重置'));
   }
@@ -689,7 +1125,7 @@ async function cmdFlow(argv) {
   if (sub === 'enable' || sub === 'disable') {
     const o = parseArgs(a, []);
     if (!o.session) die(L('--session <session-id> is required', '需要 --session <会话id>'));
-    fs.mkdirSync(FLOW_GATE, { recursive: true });
+    mkdirp(FLOW_GATE);
     if (sub === 'enable') fs.writeFileSync(gateFile(o.session), String(now()));
     else try { fs.unlinkSync(gateFile(o.session)); } catch {}
     return out(sub === 'enable' ? L('Workflows enabled', '工作流已开启') : L('Workflows disabled', '工作流已关闭'));
@@ -747,9 +1183,8 @@ async function cmdFlowRun(argv) {
   }
   const cwd = path.resolve(o.cwd || spec.cwd || old?.cwd || process.cwd());
   if (!fs.existsSync(cwd)) die(L(`working directory does not exist: ${cwd}`, `工作目录不存在：${cwd}`));
-  const id = makeId(`wf-${meta.name}`);
-  fs.mkdirSync(inboxDir(id), { recursive: true });
-  fs.writeFileSync(path.join(runDir(id), 'script.mjs'), src);
+  const id = newRunDir(`wf-${meta.name}`);
+  writePrivate(path.join(runDir(id), 'script.mjs'), src);
   writeJSON(path.join(runDir(id), 'args.json'), { value: args });
   writeJSON(statePath(id), {
     id,
@@ -812,10 +1247,18 @@ class FlowRun {
     this.journal = path.join(this.dir, 'journal.jsonl');
     // Results of the run being resumed. Key = hash of the call + which repeat of that same call
     this.prev = new Map();
-    if (this.st.resumeFrom) for (const e of readLines(path.join(runDir(this.st.resumeFrom), 'journal.jsonl'))) this.prev.set(`${e.key}#${e.n}`, e.value);
+    if (this.st.resumeFrom)
+      for (const e of readLines(path.join(runDir(this.st.resumeFrom), 'journal.jsonl'))) this.prev.set(`${e.key}#${e.n}`, { value: e.value, modelKey: e.mk });
+    // How the repository looked when the run being resumed ended, to warn about stale cached results
+    this.prevGit = this.st.resumeFrom ? readState(this.st.resumeFrom)?.gitEnd || null : null;
+    this.warnings = []; // about cached results being stale: shown when something came from the cache
+    this.notes = []; // always shown in the summary
+    this.fatalMsg = '';
+    this.writers = new Map(); // working directory -> agents writing there right now (not readonly, not isolated)
+    this.sharedWarned = false;
   }
   view(e) {
-    fs.appendFileSync(path.join(this.dir, 'view.jsonl'), JSON.stringify({ t: now(), ...e }) + '\n');
+    appendPrivate(path.join(this.dir, 'view.jsonl'), JSON.stringify({ t: now(), ...e }) + '\n');
   }
   counts() {
     const n = s => this.children.filter(c => c.status === s).length;
@@ -834,7 +1277,7 @@ class FlowRun {
     );
   }
   save(patch = {}) {
-    this.st = saveState(this.id, { children: this.children, progress: this.progress(), currentPhase: this.phase, ...patch });
+    this.st = saveState(this.id, { children: this.children, progress: this.progress(), currentPhase: this.phase, failed: this.counts().failed, ...patch });
   }
   child(info, patch) {
     let c = this.children.find(x => x.index === info.index);
@@ -860,7 +1303,30 @@ class FlowRun {
     stopChildren(this.id);
   }
 
+  // Agents that write into the same folder at the same time can overwrite each other's edits: say so once
   async runAgent(prompt, opts, info) {
+    const cwd = opts.cwd ? path.resolve(this.st.cwd, opts.cwd) : this.st.cwd;
+    const writes = !opts.readonly && opts.isolation !== 'worktree';
+    if (writes) {
+      const n = this.writers.get(cwd) || 0;
+      if (n > 0 && !this.sharedWarned) {
+        this.sharedWarned = true;
+        const w = L(
+          `Several agents that can edit files are working in ${cwd} at the same time, so they may overwrite each other's changes. Give writing agents isolation: 'worktree', or readonly: true when they only read.`,
+          `有多个能改文件的代理同时在 ${cwd} 里工作，可能互相覆盖改动。会写文件的代理请加 isolation: 'worktree'，只读的加 readonly: true。`
+        );
+        this.notes.push(w);
+        this.view({ k: 'error', text: w });
+      }
+      this.writers.set(cwd, n + 1);
+    }
+    try {
+      return await this.runOneAgent(prompt, opts, info);
+    } finally {
+      if (writes) this.writers.set(cwd, this.writers.get(cwd) - 1);
+    }
+  }
+  async runOneAgent(prompt, opts, info) {
     const schema = opts.schema && typeof opts.schema === 'object' ? opts.schema : null;
     const ev = (ev, extra) => this.view({ k: 'agent', ev, label: info.label, model: info.model, ...extra });
     let r;
@@ -871,6 +1337,7 @@ class FlowRun {
         thinking: opts.thinking,
         cwd: opts.cwd ? path.resolve(this.st.cwd, opts.cwd) : this.st.cwd,
         readonly: opts.readonly,
+        isolation: opts.isolation,
         name: info.label,
         owner: this.id,
         origin: 'flow',
@@ -883,28 +1350,47 @@ class FlowRun {
       return null;
     }
     launchServe(r.id);
-    this.child(info, { id: r.id, status: 'running' });
+    this.child(info, { id: r.id, status: 'running', note: '', branch: undefined, review: undefined, ...(info.attempt ? { attempt: info.attempt } : {}) });
     ev('start', { id: r.id });
+    // An agent in a worktree that changed files: its branch, for the panel and the summary
+    const branchOf = () => {
+      const w = readState(r.id)?.worktree;
+      if (!w?.report?.changed) return {};
+      return { branch: w.branch, note: `${w.branch}${w.report.stat ? ' · ' + w.report.stat : ''}`, review: `git -C "${w.root}" diff ${w.base.slice(0, 12)} ${w.branch}` };
+    };
     let before = 0;
     for (let attempt = 0; ; attempt++) {
       const st = await waitFor(r.id, before, 0);
       if (this.aborted || st.status !== 'done') {
-        const note = this.aborted ? L('workflow stopped', '工作流已停止') : trunc(st.lastError || statusName(st.status), 300);
-        this.child(info, { status: 'error', note });
+        const note = this.aborted
+          ? L('workflow stopped', '工作流已停止')
+          : this.fatalMsg && st.status === 'stopped'
+            ? L('stopped because the workflow failed', '工作流失败，已停止')
+            : trunc(st.lastError || statusName(st.status), 300);
+        const b = branchOf();
+        this.child(info, { status: 'error', ...b, note: b.note ? `${note} (${b.note})` : note });
         ev('error', { id: r.id, text: note });
         return null;
       }
       let text = '';
       try { text = fs.readFileSync(path.join(runDir(r.id), 'final.md'), 'utf8'); } catch {}
+      // No answer at all is not a result (answerChars: length of pi's own answer, without notes added to it)
+      if (st.answerChars === 0 || (st.answerChars === undefined && !text.trim())) {
+        const note = L('it finished without writing a final answer', '它结束了，但没有写最终回答');
+        const b = branchOf();
+        this.child(info, { status: 'error', ...b, note: b.note ? `${note} (${b.note})` : note });
+        ev('error', { id: r.id, text: note });
+        return null;
+      }
       if (!schema) {
-        this.child(info, { status: 'done' });
+        this.child(info, { status: 'done', ...branchOf() });
         ev('done', { id: r.id });
         return text;
       }
       const parsed = extractJSON(text);
       const err = parsed.ok ? validate(schema, parsed.value) : parsed.error;
       if (!err) {
-        this.child(info, { status: 'done' });
+        this.child(info, { status: 'done', ...branchOf() });
         ev('done', { id: r.id });
         return parsed.value;
       }
@@ -939,6 +1425,9 @@ class FlowRun {
       let size = 0;
       let note = '';
       let finished = false;
+      // Declared before spawning, so a failed spawn can call finish() without touching uninitialized timers
+      let timer = null;
+      let watch = null;
       const finish = code => {
         if (finished) return;
         finished = true;
@@ -953,6 +1442,7 @@ class FlowRun {
         child = spawn(file, argv, {
           cwd,
           windowsHide: true,
+          detached: process.platform !== 'win32', // its own process group, so killTree reaches its children
           env: { ...process.env, PISUB_FLOW_ID: this.id, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' },
         });
       } catch (e) {
@@ -970,14 +1460,14 @@ class FlowRun {
         finish(-1);
       });
       child.on('close', code => finish(code ?? -1));
-      const timer = setTimeout(() => {
+      timer = setTimeout(() => {
         note += L(`\n(killed after ${limitSec}s)`, `\n（超过 ${limitSec} 秒，已终止）`);
-        child.kill();
+        killTree(child.pid);
       }, limitSec * 1000);
-      const watch = setInterval(() => {
-        if (this.aborted) {
+      watch = setInterval(() => {
+        if (this.aborted || this.fatalMsg) {
           note += L('\n(killed: the workflow was stopped)', '\n（工作流已停止，已终止）');
-          child.kill();
+          killTree(child.pid);
         }
       }, 1000);
       child.stdin.on('error', () => {});
@@ -993,6 +1483,18 @@ class FlowRun {
         ? L(`Workflow "${this.st.name}" started (resuming ${this.st.resumeFrom}, ${this.prev.size} cached results available)`, `工作流「${this.st.name}」开始（从 ${this.st.resumeFrom} 续跑，可用缓存 ${this.prev.size} 条）`)
         : L(`Workflow "${this.st.name}" started`, `工作流「${this.st.name}」开始`),
     });
+    if (this.prevGit) {
+      const cur = gitSignature(this.st.cwd);
+      if (cur && (cur.head !== this.prevGit.head || cur.sig !== this.prevGit.sig)) {
+        const what = cur.head !== this.prevGit.head ? `HEAD ${(this.prevGit.head || '-').slice(0, 7)} → ${cur.head.slice(0, 7)}` : L('uncommitted changes differ', '未提交的改动不一样了');
+        const w = L(
+          `The repository changed after ${this.st.resumeFrom} finished (${what}). Cached agent() results were made from the old files and may be out of date. Calls that list their files in inputs re-run by themselves; for the others use cache: false, or start the workflow fresh instead of resuming.`,
+          `仓库在 ${this.st.resumeFrom} 结束后有变动（${what}）。缓存的 agent() 结果是按旧文件做的，可能已经过时。写了 inputs 的调用会自己重跑；其余的请加 cache: false，或者不要续跑、重新开始。`
+        );
+        this.warnings.push(w);
+        this.view({ k: 'error', text: w });
+      }
+    }
     const src = fs.readFileSync(path.join(this.dir, 'script.mjs'), 'utf8');
     const args = readJSON(path.join(this.dir, 'args.json'), {}).value;
     const meta = checkScript(src);
@@ -1011,8 +1513,16 @@ class FlowRun {
         defaultModel: this.cfg.defaultAlias || '',
         limits,
         stagger: this.cfg.flowStaggerMs || {},
+        failFast: meta.failFast,
         hooks: {
           runAgent: (p, o, info) => this.runAgent(p, o, info),
+          fingerprint: (paths, o) => hashInputs(paths, o.cwd ? path.resolve(this.st.cwd, o.cwd) : this.st.cwd),
+          onFatal: msg => {
+            this.fatalMsg = msg;
+            this.view({ k: 'error', text: msg });
+            this.save();
+            stopChildren(this.id);
+          },
           runSh: (c, o) => this.runSh(c, o),
           log: text => this.view({ k: 'info', text }),
           phase: title => {
@@ -1026,9 +1536,14 @@ class FlowRun {
             this.view({ k: 'agent', ev: 'cached', label: info.label, model: info.model });
           },
           isAborted: () => this.aborted,
-          cached: (key, n) => (this.prev.has(`${key}#${n}`) ? { value: this.prev.get(`${key}#${n}`) } : null),
+          cached: (key, n) => this.prev.get(`${key}#${n}`) ?? null,
           record: (key, n, value, info) =>
-            fs.appendFileSync(this.journal, JSON.stringify({ key, n, value, index: info.index, label: info.label, cached: !!info.cached }) + '\n'),
+            appendPrivate(this.journal, JSON.stringify({ key, n, value, index: info.index, label: info.label, cached: !!info.cached, mk: info.modelKey }) + '\n'),
+          // What an alias stands for now (provider pools rotate, so the provider is left out)
+          modelKey: m => {
+            const r = resolveModel(m, this.cfg);
+            return r.model ? `${r.model}${r.thinking ? '@' + r.thinking : ''}` : 'pi-default';
+          },
         },
       });
     } catch (e) {
@@ -1036,12 +1551,36 @@ class FlowRun {
     }
     clearInterval(inboxTimer);
     this.pollInbox();
+    // Nothing of this workflow may keep running after it ended with an error
+    if (error) stopChildren(this.id);
+    const unawaited = result?.stats?.unawaited || 0;
+    if (unawaited)
+      this.notes.push(
+        L(
+          `The script returned before ${unawaited} agent()/sh() calls had finished (a missing await?). The workflow waited for them, but the script's return value does not contain their results.`,
+          `脚本在 ${unawaited} 个 agent()/sh() 调用结束前就返回了（漏了 await？）。工作流等它们结束了，但脚本的返回值里没有它们的结果。`
+        )
+      );
     const k = this.counts();
     const took = fmtDuration(now() - this.t0);
     const summary = L(
       `(Workflow "${this.st.name}": ${this.children.length} agent() calls, ${k.done} done, ${k.failed} failed, ${k.cached} from cache; took ${took})`,
       `（工作流「${this.st.name}」：agent() 调用 ${this.children.length} 次，完成 ${k.done}，失败 ${k.failed}，缓存命中 ${k.cached}；用时 ${took}）`
     );
+    const head = [summary];
+    const failed = this.children.filter(c => c.status === 'error');
+    if (failed.length) {
+      head.push(L(`Failed agents (${failed.length}):`, `失败的代理（${failed.length} 个）：`));
+      for (const c of failed.slice(0, 20)) head.push(`  ✗ #${c.index} ${c.label} (${c.model}): ${trunc(c.note || '', 200)}${c.id ? `  [${c.id}]` : ''}`);
+      if (failed.length > 20) head.push('  …');
+    }
+    const changed = this.children.filter(c => c.branch);
+    if (changed.length) {
+      head.push(L(`Agents that changed files, each on its own branch (review with the command shown; apply one to your working tree with pisub apply <agent id>):`, `改了文件的代理，各在自己的分支上（用下面的命令查看；要应用到你的工作区，用 pisub apply <代理编号>）：`));
+      for (const c of changed) head.push(`  #${c.index} ${c.label}: ${c.note}  [${c.id}]\n      ${c.review}`);
+    }
+    if (k.cached) for (const w of this.warnings) head.push(L('Warning: ', '注意：') + w);
+    for (const w of this.notes) head.push(L('Warning: ', '注意：') + w);
     let status;
     let body;
     if (this.aborted) {
@@ -1049,20 +1588,21 @@ class FlowRun {
       body = L('The workflow was stopped.', '工作流被停止。') + (result ? L(`\n\nThe script's return value before stopping:\n`, `\n\n停止前脚本的返回值：\n`) + fmtValue(result.value) : '');
     } else if (error) {
       status = 'error';
-      body = L('The workflow script failed:\n', '工作流脚本出错：\n') + String(error?.stack || error);
+      body = error.fatal ? L('The workflow failed: ', '工作流失败：') + error.message : L('The workflow script failed:\n', '工作流脚本出错：\n') + String(error?.stack || error);
     } else {
       status = 'done';
       body = fmtValue(result.value);
       writeJSON(path.join(this.dir, 'result.json'), { value: result.value ?? null });
     }
-    fs.writeFileSync(path.join(this.dir, 'final.md'), `${summary}\n\n${body}\n`);
+    writePrivate(path.join(this.dir, 'final.md'), `${head.join('\n')}\n\n${body}\n`);
     this.view({ k: 'done', round: (this.st.rounds || 0) + 1, status });
     this.save({
       status,
       rounds: (this.st.rounds || 0) + 1,
       finishedAt: now(),
-      lastError: error ? trunc(String(error?.stack || error), 2000) : '',
+      lastError: error ? trunc(error.fatal ? error.message : String(error?.stack || error), 2000) : '',
       finalPreview: trunc(body, 300),
+      gitEnd: gitSignature(this.st.cwd) || undefined,
     });
   }
 }
@@ -1080,13 +1620,118 @@ async function cmdServe(argv) {
       }
     } catch (e) {
       const st = readState(id);
-      saveState(id, { status: 'error', lastError: String(e?.stack || e), rounds: (st.rounds || 0) + 1 });
+      if (isAlive(Number(st.piPid))) killTree(st.piPid);
+      const msg = L(`the broker failed: ${e?.message || e}`, `broker 出错：${e?.message || e}`);
+      try { writePrivate(path.join(runDir(id), 'final.md'), `${errorTitle()}${msg}\n`); } catch {}
+      saveState(id, { status: 'error', lastError: String(e?.stack || e), rounds: (st.rounds || 0) + 1, finishedAt: now() });
     } finally {
+      releaseSlot();
       releaseLock(id);
     }
     // Check the inbox once more after releasing the lock, so a message that arrived as we exited is not lost
-    if (!hasInbox(id)) return;
+    if (!hasInbox(id)) return maybeAutoClean();
   }
+}
+
+// ---------- applying an isolated agent's work, and removing old runs ----------
+// pisub apply <id> [--check] [--3way]: bring an agent's branch into the repository it was started from.
+// Plain apply changes only the working tree and refuses as a whole when anything conflicts; --3way merges what
+// it can and leaves conflict markers (like git apply --3way, it also stages the result).
+function cmdApply(argv) {
+  const o = parseArgs(argv, ['check', '3way']);
+  const id = checkId(o._[0]);
+  const w = readState(id).worktree;
+  if (!w) die(L(`${id} did not work in a worktree, so there is nothing to apply (its changes are already in its folder)`, `${id} 不是在 worktree 里工作的，没有要应用的东西（它的改动本来就在它的目录里）`));
+  const ref = `refs/heads/${w.branch}`;
+  if (!git(w.root, ['rev-parse', '--verify', '-q', ref]).ok) die(L(`branch ${w.branch} no longer exists in ${w.root}`, `${w.root} 里已经没有分支 ${w.branch}`));
+  const diff = git(w.root, ['diff', '--binary', '--no-color', '--no-ext-diff', w.base, ref], { raw: true });
+  if (!diff.ok) die(diff.err);
+  if (!diff.out.length) return out(L(`${w.branch} has no changes; nothing to apply`, `${w.branch} 没有改动，不用应用`));
+  const files = (gitOut(w.root, ['diff', '--name-only', w.base, ref]) || '').split('\n').filter(Boolean);
+  const args = ['apply', '--binary', '--whitespace=nowarn', ...(o.check ? ['--check'] : []), ...(o['3way'] ? ['--3way'] : [])];
+  const r = git(w.root, args, { input: diff.out });
+  const list = files.slice(0, 30).map(f => `  ${f}`).join('\n') + (files.length > 30 ? '\n  …' : '');
+  if (!r.ok) {
+    if (r.err) process.stderr.write(r.err + '\n');
+    die(
+      o['3way']
+        ? L(`merged ${w.branch} into ${w.root} with conflicts: fix the conflict markers in the files listed above`, `已把 ${w.branch} 合入 ${w.root}，但有冲突：请处理上面列出的文件里的冲突标记`)
+        : L(
+            `${w.branch} does not apply cleanly to ${w.root}${o.check ? '' : ', so nothing was changed'}. Your files have moved on since the agent started. Options: pisub apply ${id} --3way (merge, leaving conflict markers), or review with git -C "${w.root}" diff ${w.base.slice(0, 12)} ${w.branch}`,
+            `${w.branch} 不能干净地应用到 ${w.root}${o.check ? '' : '，所以什么都没改'}。代理开始之后你的文件又改过了。可以：pisub apply ${id} --3way（合并，冲突处留下标记），或者用 git -C "${w.root}" diff ${w.base.slice(0, 12)} ${w.branch} 查看`
+          )
+    );
+  }
+  if (o.check) return out(L(`${w.branch} applies cleanly to ${w.root} (${files.length} ${files.length === 1 ? 'file' : 'files'}):\n${list}`, `${w.branch} 可以干净地应用到 ${w.root}（${files.length} 个文件）：\n${list}`));
+  out(
+    L(
+      `Applied ${w.branch} to ${w.root} (${files.length} ${files.length === 1 ? 'file' : 'files'}, not committed):\n${list}\nThe branch is kept; remove it with pisub clean ${id} --branches`,
+      `已把 ${w.branch} 应用到 ${w.root}（${files.length} 个文件，没有提交）：\n${list}\n分支还保留着，不需要了用 pisub clean ${id} --branches 删除`
+    )
+  );
+}
+
+// Remove finished runs: their folders (task, transcript, tool output) and worktrees. Branches with changes are
+// kept unless branches is set, since they may hold work nobody applied yet.
+function cleanRuns({ days = 0, ids = null, dryRun = false, branches = false } = {}) {
+  const cutoff = now() - days * 86400000;
+  let names = ids;
+  if (!names) {
+    try { names = fs.readdirSync(RUNS); } catch { names = []; }
+  }
+  const removed = [];
+  const busy = [];
+  const kept = [];
+  for (const id of names) {
+    const st = readState(id);
+    if (!st) continue;
+    if (!TERMINAL.has(st.status) || isServing(id) || hasInbox(id)) {
+      if (ids) busy.push(id);
+      continue;
+    }
+    if (!ids && (st.finishedAt || st.updatedAt || st.createdAt || 0) > cutoff) continue;
+    removed.push(id);
+    if (dryRun) continue;
+    const w = st.worktree;
+    const repo = w && fs.existsSync(w.root);
+    if (repo && fs.existsSync(w.dir)) git(w.root, ['worktree', 'remove', '--force', w.dir]);
+    if (repo && git(w.root, ['rev-parse', '--verify', '-q', `refs/heads/${w.branch}`]).ok) {
+      if (branches) git(w.root, ['branch', '-q', '-D', w.branch]);
+      else kept.push(`${w.branch} (${w.root})`);
+    }
+    try { fs.rmSync(runDir(id), { recursive: true, force: true }); } catch {}
+    if (repo) git(w.root, ['worktree', 'prune']);
+  }
+  return { removed, busy, kept };
+}
+function cmdClean(argv) {
+  const o = parseArgs(argv, ['dry-run', 'branches', 'json']);
+  const ids = o._.length ? o._.map(checkId) : null;
+  const days = o.days !== undefined ? Number(o.days) : Number(loadConfig().keepRunsDays) || 0;
+  if (!ids && !(days >= 0)) die(L('--days must be a number of days', '--days 必须是天数'));
+  if (!ids && !days && o.days === undefined) die(L('keepRunsDays is 0 in config.json, so say how old with --days N (0 = every finished run)', 'config.json 里 keepRunsDays 是 0，请用 --days N 指定多少天以前的（0 = 所有已结束的）'));
+  const r = cleanRuns({ days, ids, dryRun: !!o['dry-run'], branches: !!o.branches });
+  if (o.json) return out(JSON.stringify(r));
+  out(
+    o['dry-run']
+      ? L(`Would remove ${r.removed.length} finished ${r.removed.length === 1 ? 'run' : 'runs'}`, `将删除 ${r.removed.length} 个已结束的运行`)
+      : L(`Removed ${r.removed.length} finished ${r.removed.length === 1 ? 'run' : 'runs'}`, `已删除 ${r.removed.length} 个已结束的运行`)
+  );
+  if (r.busy.length) out(L(`Not finished, left alone: ${r.busy.join(', ')}`, `还没结束，没动：${r.busy.join('、')}`));
+  if (r.kept.length) out(L(`Branches kept (they may hold changes nobody applied; add --branches to delete them):\n  `, `保留的分支（里面可能有还没应用的改动；加 --branches 一起删）：\n  `) + r.kept.join('\n  '));
+}
+// Once a day a broker, on its way out, removes runs older than keepRunsDays (0 turns this off)
+function maybeAutoClean() {
+  const days = Number(loadConfig().keepRunsDays) || 0;
+  if (days <= 0) return;
+  const mark = path.join(HOME, 'last-clean');
+  try {
+    if (now() - fs.statSync(mark).mtimeMs < 86400000) return;
+  } catch {}
+  try {
+    writePrivate(mark, String(now()));
+    cleanRuns({ days });
+  } catch {}
 }
 
 const errorTitle = () => L('[pi sub-agent error] ', '【pi 子代理出错】');
@@ -1108,12 +1753,19 @@ class PiSession {
     this.sent = []; // messages sent to pi that have not shown up in its events yet (to label who sent them)
     this.live = { text: '', thinking: '', tool: '' };
     this.liveTimer = null;
+    this.badLines = 0; // stdout lines that were not JSON
+    this.toolsRunning = 0;
+    this.toolStartedAt = 0;
+    this.lastEventAt = now();
+    this.idleAfterSettle = false; // the run settled while a message was being delivered
+    this.rejected = ''; // why pi turned down the last prompt
+    this.gaveUp = ''; // why the broker killed pi (hung, broken protocol)
   }
   view(entry) {
-    fs.appendFileSync(path.join(this.dir, 'view.jsonl'), JSON.stringify({ t: now(), ...entry }) + '\n');
+    appendPrivate(path.join(this.dir, 'view.jsonl'), JSON.stringify({ t: now(), ...entry }) + '\n');
   }
   event(rec) {
-    fs.appendFileSync(path.join(this.dir, 'events.jsonl'), JSON.stringify({ t: now(), ...rec }) + '\n');
+    appendPrivate(path.join(this.dir, 'events.jsonl'), JSON.stringify({ t: now(), ...rec }) + '\n');
   }
   state(patch) {
     return saveState(this.id, patch);
@@ -1129,13 +1781,36 @@ class PiSession {
       flush();
     } else this.liveTimer = setTimeout(flush, 400);
   }
-  send(cmd) {
+  // Every request has a deadline: a pi that stops answering must not leave the agent waiting forever
+  send(cmd, timeoutMs = (Number(this.cfg.rpcTimeoutSec) || 60) * 1000) {
     const id = `b${++this.reqSeq}`;
     return new Promise((resolve, reject) => {
       if (!this.child || this.child.exitCode !== null) return reject(new Error(L('pi has exited', 'pi 已退出')));
-      this.pending.set(id, { resolve, reject });
+      const timer = setTimeout(() => {
+        if (!this.pending.delete(id)) return;
+        const e = new Error(L(`pi did not answer "${cmd.type}" within ${Math.round(timeoutMs / 1000)}s`, `pi 在 ${Math.round(timeoutMs / 1000)} 秒内没有回应「${cmd.type}」`));
+        e.timeout = true;
+        reject(e);
+      }, timeoutMs);
+      this.pending.set(id, {
+        resolve: r => {
+          clearTimeout(timer);
+          resolve(r);
+        },
+        reject: e => {
+          clearTimeout(timer);
+          reject(e);
+        },
+      });
       this.child.stdin.write(JSON.stringify({ ...cmd, id }) + '\n');
     });
+  }
+  // pi hung or broke the protocol: kill it. The round then ends with this reason as its error.
+  giveUp(reason) {
+    if (this.closing || this.gaveUp) return;
+    this.gaveUp = reason;
+    this.view({ k: 'error', text: reason });
+    killTree(this.child?.pid);
   }
   async run() {
     let st = readState(this.id);
@@ -1154,22 +1829,58 @@ class PiSession {
       this.view({ k: 'info', text: L(`provider ${st.provider} is cooling down; switching to ${p}`, `提供方 ${st.provider} 在冷却中，改用 ${p}`) });
       st = this.state({ provider: p, accountsTried: [...new Set([...(st.accountsTried || []), p])] });
     }
+    let workCwd = st.cwd;
+    if (st.worktree) {
+      const err = ensureWorktree(st.worktree);
+      if (err) {
+        this.fatal = true;
+        return this.failWithoutPi(L(`could not set up the agent's git worktree again: ${err}`, `没能重新建立代理的 git worktree：${err}`));
+      }
+      if (st.worktree.removed) st = this.state({ worktree: { ...st.worktree, removed: false } });
+      workCwd = path.join(st.worktree.dir, st.worktree.prefix || '');
+    }
+    // Global limit across every session and workflow on this machine
+    const max = Number(this.cfg.maxAgents) || 0;
+    if (max > 0 && !mySlot) {
+      let shown = false;
+      while (!(mySlot = tryTakeSlot(max, this.id))) {
+        if (!shown) {
+          shown = true;
+          this.state({ status: 'queued' });
+          this.view({ k: 'info', text: L(`waiting for a free slot: ${runningSlots()} pi agents are running on this machine (maxAgents is ${max})`, `等待空位：本机已有 ${runningSlots()} 个 pi 代理在运行（maxAgents 为 ${max}）`) });
+        }
+        if (inboxFiles(this.id).some(f => readJSON(path.join(inboxDir(this.id), f), {})?.control === 'stop')) {
+          this.fatal = true;
+          return this.failWithoutPi(L('stopped while waiting for a free slot; it never started', '排队等空位时被停止，没有开始运行'), 'stopped');
+        }
+        await sleep(1000 + Math.floor(Math.random() * 500));
+      }
+    }
     const args = [cli, '--mode', 'rpc', '--session-dir', path.join(this.dir, 'session'), '--name', this.id];
-    // By default pi skips context files, so the task it was given is all it works from
-    if (!this.cfg.contextFiles) args.push('--no-context-files');
+    // By default pi skips context files, so the task it was given is all it works from (per task: contextFiles)
+    if (!(st.contextFiles ?? this.cfg.contextFiles)) args.push('--no-context-files');
     if (st.model) args.push('--model', st.provider ? `${st.provider}/${st.model}` : st.model);
     if (st.thinking) args.push('--thinking', st.thinking);
-    if (st.readonly) args.push('--tools', 'read,grep,find,ls');
+    // Read-only: only pi's four read tools. --tools alone keeps MCP tools, so MCP is switched off as well, and
+    // project-local pi extensions and settings are ignored. This limits tools; it is not a filesystem sandbox.
+    if (st.readonly) args.push('--tools', 'read,grep,find,ls', '--no-mcp', '--no-approve');
     if (st.sessionFile && fs.existsSync(st.sessionFile)) args.push('--session', st.sessionFile);
     this.state({ status: 'running', brokerPid: process.pid });
-    const errLog = fs.openSync(path.join(this.dir, 'pi-stderr.log'), 'a');
-    this.child = spawn(process.execPath, args, { cwd: st.cwd, stdio: ['pipe', 'pipe', errLog], windowsHide: true });
+    const errLog = fs.openSync(path.join(this.dir, 'pi-stderr.log'), 'a', FILE_MODE);
+    this.child = spawn(process.execPath, args, {
+      cwd: workCwd,
+      stdio: ['pipe', 'pipe', errLog],
+      windowsHide: true,
+      detached: process.platform !== 'win32', // its own process group, so killTree also ends its shell commands
+    });
     fs.closeSync(errLog);
     this.state({ piPid: this.child.pid });
 
     let buf = Buffer.alloc(0);
+    const MAX_LINE = 64 * 1024 * 1024;
     this.child.stdout.on('data', chunk => {
-      buf = Buffer.concat([buf, chunk]);
+      this.lastEventAt = now();
+      buf = buf.length ? Buffer.concat([buf, chunk]) : chunk;
       let i;
       while ((i = buf.indexOf(10)) >= 0) {
         let line = buf.subarray(0, i).toString('utf8');
@@ -1177,13 +1888,52 @@ class PiSession {
         if (line.endsWith('\r')) line = line.slice(0, -1);
         if (!line.trim()) continue;
         let rec;
-        try { rec = JSON.parse(line); } catch { continue; }
+        try {
+          rec = JSON.parse(line);
+        } catch {
+          // stdout is reserved for protocol records: count garbage, keep a few samples, give up if it keeps coming
+          if (++this.badLines <= 5) this.view({ k: 'error', text: L(`pi sent a line that is not JSON (skipped): ${trunc(line, 200)}`, `pi 输出了一行不是 JSON 的内容（已跳过）：${trunc(line, 200)}`) });
+          if (this.badLines === 100) this.giveUp(L('pi sent 100 lines that are not valid JSON; its RPC output looks broken', 'pi 输出了 100 行不合法的 JSON，RPC 输出看起来坏了'));
+          continue;
+        }
         this.onRecord(rec).catch(e => this.view({ k: 'error', text: L(`broker internal error: ${e?.message || e}`, `broker 内部错误：${e?.message || e}`) }));
+      }
+      if (buf.length > MAX_LINE) {
+        buf = Buffer.alloc(0);
+        this.giveUp(L('pi sent more than 64 MB without a line break; its RPC output looks broken', 'pi 输出了超过 64 MB 却没有换行，RPC 输出看起来坏了'));
       }
     });
     this.child.stdin.on('error', () => {});
+    // Watchdog: a working agent that goes silent (no tool running), or a tool call that never ends, is hung
+    const stall = (Number(this.cfg.stallTimeoutMin) || 0) * 60000;
+    const tool = (Number(this.cfg.toolTimeoutMin) || 0) * 60000;
+    const tick = Math.max(500, Math.min(15000, Math.min(stall || Infinity, tool || Infinity) / 4));
+    this.watchdog = setInterval(() => {
+      if (this.closing || !this.busy || this.waitingRetry) return;
+      if (this.toolsRunning > 0) {
+        if (tool && now() - this.toolStartedAt > tool) this.giveUp(L(`a tool call has been running for over ${this.cfg.toolTimeoutMin} min (toolTimeoutMin); treating it as hung`, `一个工具调用已运行超过 ${this.cfg.toolTimeoutMin} 分钟（toolTimeoutMin），按卡死处理`));
+      } else if (stall && now() - this.lastEventAt > stall) {
+        this.giveUp(L(`pi sent nothing for ${this.cfg.stallTimeoutMin} min while working (stallTimeoutMin); treating it as hung`, `pi 工作中 ${this.cfg.stallTimeoutMin} 分钟没有任何输出（stallTimeoutMin），按卡死处理`));
+      }
+    }, tick);
 
-    const exited = new Promise(resolve => this.child.on('close', code => resolve(code)));
+    // When pi exits (an unknown model makes it quit at once), fail every request still waiting for an answer;
+    // otherwise run() would wait forever on get_state and the broker would quietly die and be restarted
+    const exited = new Promise(resolve => {
+      let done = false;
+      const end = code => {
+        if (done) return;
+        done = true;
+        for (const p of this.pending.values()) p.reject(new Error(L('pi has exited', 'pi 已退出')));
+        this.pending.clear();
+        resolve(code);
+      };
+      this.child.on('close', end);
+      this.child.on('error', e => {
+        try { appendPrivate(path.join(this.dir, 'pi-stderr.log'), `${e.message}\n`); } catch {}
+        end(-1);
+      });
+    });
     try {
       const s = await this.send({ type: 'get_state' });
       if (s.success) {
@@ -1197,62 +1947,134 @@ class PiSession {
         }
         if (Object.keys(patch).length) this.state(patch);
       }
-    } catch {}
+    } catch (e) {
+      if (e.timeout) this.giveUp(L(`pi did not finish starting up: ${e.message}`, `pi 没能完成启动：${e.message}`));
+    }
     this.inboxTimer = setInterval(() => this.pumpInbox().catch(() => {}), 300);
     this.pumpInbox().catch(() => {});
 
     const code = await exited;
     clearInterval(this.inboxTimer);
+    clearInterval(this.watchdog);
     clearTimeout(this.liveTimer);
     for (const p of this.pending.values()) p.reject(new Error(L('pi has exited', 'pi 已退出')));
     if (!this.closing) {
-      // pi exited by itself (unknown model, crash, ...)
+      // pi exited by itself (unknown model, crash, ...) or was killed as hung
       let tail = '';
       try { tail = fs.readFileSync(path.join(this.dir, 'pi-stderr.log'), 'utf8').slice(-1500); } catch {}
       this.fatal = true;
-      this.failWithoutPi(L(`the pi process exited unexpectedly (exit code ${code}). ${tail.trim()}`, `pi 进程意外退出（退出码 ${code}）。${tail.trim()}`));
+      this.failWithoutPi(this.gaveUp || L(`the pi process exited unexpectedly (exit code ${code}). ${tail.trim()}`, `pi 进程意外退出（退出码 ${code}）。${tail.trim()}`));
     }
+    // pi has exited, so Windows lets go of the folder: now an unchanged worktree can be removed
+    this.dropWorktreeNow();
   }
-  failWithoutPi(msg) {
+  failWithoutPi(msg, status = 'error') {
     const st = readState(this.id);
     for (const f of inboxFiles(this.id)) try { fs.unlinkSync(path.join(inboxDir(this.id), f)); } catch {}
-    fs.writeFileSync(path.join(this.dir, 'final.md'), `${errorTitle()}${msg}\n`);
-    this.view({ k: 'error', text: msg });
-    this.view({ k: 'done', status: 'error', round: (st.rounds || 0) + 1 });
-    this.state({ status: 'error', lastError: msg, finishedAt: now(), rounds: (st.rounds || 0) + 1 });
+    const wt = this.wrapWorktree();
+    writePrivate(path.join(this.dir, 'final.md'), `${status === 'stopped' ? L('[stopped] ', '【已停止】') : errorTitle()}${msg}${wt}\n`);
+    if (status === 'error') this.view({ k: 'error', text: msg });
+    this.view({ k: 'done', status, round: (st.rounds || 0) + 1 });
+    this.state({ status, lastError: status === 'error' ? msg : '', finishedAt: now(), rounds: (st.rounds || 0) + 1 });
+    if (!this.child || this.child.exitCode !== null) this.dropWorktreeNow();
   }
+  // Commit what the agent changed on its branch. Returns the text added to its final answer (none for
+  // workflow agents: there the answer is the script's value, and the workflow summary lists the branches).
+  wrapWorktree() {
+    const st = readState(this.id);
+    if (!st.worktree || st.worktree.removed) return '';
+    const rep = commitWorktree(st);
+    if (!rep) return '';
+    this.state({ worktree: { ...st.worktree, report: rep } });
+    if (!rep.changed) this.dropWorktree = true;
+    return st.origin === 'flow' ? '' : '\n\n' + worktreeReport(st.worktree, rep, this.id);
+  }
+  dropWorktreeNow() {
+    if (!this.dropWorktree) return;
+    this.dropWorktree = false;
+    const st = readState(this.id);
+    if (!st.worktree) return;
+    removeWorktree(st.worktree);
+    this.state({ worktree: { ...st.worktree, removed: true } });
+  }
+  // Deliver queued messages in order. A message leaves the inbox only after pi answered it (accepted or turned
+  // down): if the broker dies in between, the next broker delivers it again (at least once, never lost).
   async pumpInbox() {
-    if (this.closing || this.pumping) return;
+    if (this.closing) return;
+    if (this.pumping) {
+      this.repump = true;
+      return;
+    }
     this.pumping = true;
     try {
-      for (const f of inboxFiles(this.id)) {
-        const file = path.join(inboxDir(this.id), f);
-        const msg = readJSON(file, null);
-        try { fs.unlinkSync(file); } catch {}
-        if (!msg) continue;
-        if (msg.control === 'stop') {
-          await this.stop();
-          return;
-        }
-        if (this.stopping) continue;
-        this.sent.push({ text: msg.text, from: msg.from || 'claude', mode: this.busy ? msg.mode : 'prompt' });
-        if (!this.busy) {
-          this.busy = true;
-          this.state({ status: 'running' });
-          const r = await this.send({ type: 'prompt', message: msg.text });
-          if (!r.success) {
-            this.busy = false;
-            this.view({ k: 'error', text: L(`pi rejected the message: ${r.error}`, `pi 拒绝了消息：${r.error}`) });
+      do {
+        this.repump = false;
+        for (const f of inboxFiles(this.id)) {
+          if (this.closing) return;
+          const file = path.join(inboxDir(this.id), f);
+          const msg = readJSON(file, null);
+          if (!msg) {
+            try { fs.renameSync(file, `${file}.bad`); } catch {}
+            this.view({ k: 'error', text: L(`skipped a message file that could not be read: ${f}`, `跳过了一个读不了的消息文件：${f}`) });
+            continue;
           }
-        } else {
-          const type = msg.mode === 'follow_up' ? 'follow_up' : 'steer';
-          const r = await this.send({ type, message: msg.text });
-          if (!r.success) this.view({ k: 'error', text: L(`the message did not get through: ${r.error}`, `消息没送进去：${r.error}`) });
+          if (msg.control === 'stop') {
+            try { fs.unlinkSync(file); } catch {}
+            await this.stop();
+            return;
+          }
+          if (this.stopping) {
+            try { fs.unlinkSync(file); } catch {}
+            continue;
+          }
+          try {
+            await this.deliver(msg);
+          } catch (e) {
+            // No answer: the message stays in the inbox, unacknowledged
+            if (e.timeout) this.giveUp(e.message);
+            return;
+          }
+          try { fs.unlinkSync(file); } catch {}
         }
-      }
+      } while (this.repump && !this.closing);
     } finally {
       this.pumping = false;
     }
+    // Nothing is running and nothing is queued: this round is over
+    if (this.closing || this.busy || hasInbox(this.id)) return;
+    if (this.rejected) return this.finalize('error', this.rejected);
+    if (this.idleAfterSettle) return this.finalize('done');
+  }
+  async deliver(msg) {
+    if (this.busy) {
+      this.sent.push({ text: msg.text, from: msg.from || 'claude', mode: msg.mode });
+      const r = await this.send({ type: msg.mode === 'follow_up' ? 'follow_up' : 'steer', message: msg.text });
+      if (r.success) return r;
+      if (this.busy) {
+        this.view({ k: 'error', text: L(`the message did not get through: ${r.error}`, `消息没送进去：${r.error}`) });
+        return r;
+      }
+      // The run ended while the message was on its way: start a new run with it instead
+      this.sent.pop();
+    }
+    this.sent.push({ text: msg.text, from: msg.from || 'claude', mode: 'prompt' });
+    this.busy = true;
+    this.idleAfterSettle = false;
+    this.rejected = '';
+    this.state({ status: 'running' });
+    const r = await this.send({ type: 'prompt', message: msg.text });
+    if (!r.success) {
+      // Turned down before it started: no run and no agent_settled will follow, so the round must end here
+      this.busy = false;
+      this.rejected = L(`pi rejected the message: ${r.error}`, `pi 拒绝了消息：${r.error}`);
+      this.view({ k: 'error', text: this.rejected });
+    } else if (r.data?.disposition === 'handled') {
+      // An extension command or input handler consumed it: no run starts, so no agent_settled will come
+      this.busy = false;
+      this.idleAfterSettle = true;
+      this.view({ k: 'info', text: L('pi handled the message itself; no model run was started', 'pi 自己处理了这条消息，没有启动模型运行') });
+    }
+    return r;
   }
   async stop() {
     this.stopping = true;
@@ -1325,9 +2147,11 @@ class PiSession {
         break;
       }
       case 'tool_execution_start':
+        if (this.toolsRunning++ === 0) this.toolStartedAt = now();
         this.view({ k: 'tool', name: rec.toolName, args: summarizeArgs(rec.args) });
         break;
       case 'tool_execution_end': {
+        this.toolsRunning = Math.max(0, this.toolsRunning - 1);
         const text = (rec.result?.content || []).filter(c => c.type === 'text').map(c => c.text).join('\n');
         this.view({ k: 'tool_end', name: rec.toolName, ok: !rec.isError, ms: rec.durationMs, out: trunc(text, 1500) });
         break;
@@ -1351,6 +2175,7 @@ class PiSession {
         });
         break;
       case 'agent_settled':
+        this.toolsRunning = 0;
         await this.onSettled(rec);
         break;
     }
@@ -1399,9 +2224,10 @@ class PiSession {
     }
     if (rec.aborted || last?.stopReason === 'aborted') return this.finalize('stopped');
     this.retries = 0;
-    // Someone sent a message while it was wrapping up: keep going
-    if (hasInbox(this.id)) {
+    // Someone sent a message while it was wrapping up (or one is on its way to pi): keep going
+    if (hasInbox(this.id) || this.pumping) {
       this.busy = false;
+      this.idleAfterSettle = true;
       return this.pumpInbox();
     }
     return this.finalize('done');
@@ -1420,12 +2246,15 @@ class PiSession {
     clearInterval(this.inboxTimer);
     let text = null;
     let stats = null;
-    try { text = (await this.send({ type: 'get_last_assistant_text' })).data?.text ?? null; } catch {}
-    try { stats = (await this.send({ type: 'get_session_stats' })).data ?? null; } catch {}
-    let final = text || '';
+    try { text = (await this.send({ type: 'get_last_assistant_text' }, 15000)).data?.text ?? null; } catch {}
+    try { stats = (await this.send({ type: 'get_session_stats' }, 15000)).data ?? null; } catch {}
+    const answerChars = (text || '').trim().length;
+    let final = answerChars ? text : L('(pi finished without writing a final answer)', '（pi 结束了，但没有写最终回答）');
     if (status === 'error') final = errorTitle() + (errText || L('unknown error', '未知错误')) + lastAnswer(text);
     if (status === 'stopped') final = L('[stopped]', '【已停止】') + lastAnswer(text);
-    fs.writeFileSync(path.join(this.dir, 'final.md'), final + '\n');
+    // Before the status says "done": a workflow reading this agent's state then sees its branch
+    final += this.wrapWorktree();
+    writePrivate(path.join(this.dir, 'final.md'), final + '\n');
     const st = readState(this.id);
     const round = (st.rounds || 0) + 1;
     this.view({ k: 'done', status, round });
@@ -1435,6 +2264,7 @@ class PiSession {
       finishedAt: now(),
       lastError: status === 'error' ? errText || '' : '',
       finalPreview: trunc(final, 300),
+      answerChars,
       usage: stats?.tokens,
       cost: stats?.cost,
       context: stats?.contextUsage,
@@ -1444,7 +2274,7 @@ class PiSession {
     this.writeLive(true);
     this.child.stdin.end();
     const child = this.child;
-    setTimeout(() => { if (child.exitCode === null) child.kill(); }, 15000).unref();
+    setTimeout(() => { if (child.exitCode === null) killTree(child.pid); }, 15000).unref();
   }
 }
 function summarizeArgs(args) {
@@ -1460,11 +2290,13 @@ function summarizeArgs(args) {
 }
 
 const HELP_EN = `pisub: run the pi coding agent as a background sub-agent
-  spawn  [--model alias|provider/model] [--thinking level] [--cwd dir] [--readonly]
+  spawn  [--model alias|provider/model] [--thinking level] [--cwd dir] [--readonly] [--worktree]
          [--name name] [--owner session-id] [--wait] [--timeout sec] [--json]
          (--task-file file | --stdin | task text)
          Start a pi sub-agent. Prints its id right away; with --wait, waits and prints only its final answer.
          Without --model: the configured defaultAlias, or pi's own default model.
+         --worktree: work in its own git worktree (branch pi/<id>) instead of your files; its changes are
+         committed on that branch, and the final answer says how to review and apply them.
   send   <id> [--mode steer|follow_up] [--from claude|user] [--wait] (--text-file file | --stdin | text)
          Message it: while running = steer (or follow_up); after it finished = resume its previous session.
   status [id] [--owner session-id] [--json] [--limit N]   show status
@@ -1475,6 +2307,10 @@ const HELP_EN = `pisub: run the pi coding agent as a background sub-agent
   models [--json]                                         list model aliases from config.json
   models --pi [search]                                    list the models pi knows (pi --list-models)
   accounts [reset [provider]]                             show / reset provider-pool cooldowns
+  apply  <id> [--check] [--3way]                          apply a --worktree agent's branch to your working tree
+                                                          (--check: only test; --3way: merge, leaving conflict markers)
+  clean  [id...] [--days N] [--branches] [--dry-run]      remove finished runs (default: older than keepRunsDays)
+                                                          and their worktrees; --branches also deletes pi/<id> branches
   paths                                                   print the run directory and other paths (JSON)
   flow run --owner session-id (--script-file script | --stdin-json) [--args JSON | --args-file file]
            [--resume old-workflow-id] [--cwd dir] [--wait] [--json]
@@ -1487,11 +2323,13 @@ Runs:   ${RUNS}
 Language: English (set "language": "zh" in config.json or PISUB_LANG=zh for Chinese)`;
 
 const HELP_ZH = `pisub —— 把 pi 编码代理当后台子代理用
-  spawn  [--model 别名|provider/model] [--thinking 级别] [--cwd 目录] [--readonly]
+  spawn  [--model 别名|provider/model] [--thinking 级别] [--cwd 目录] [--readonly] [--worktree]
          [--name 名称] [--owner 会话id] [--wait] [--timeout 秒] [--json]
          (--task-file 文件 | --stdin | 任务文本)
          启动一个 pi 子代理，默认立即返回编号；--wait 则等它做完并只输出最终回答。
          不写 --model：用配置里的 defaultAlias，没有就用 pi 自己的默认模型。
+         --worktree：在它自己的 git worktree（分支 pi/<编号>）里干活，不碰你的文件；改动提交到这个分支，
+         最终回答里会写怎么查看和应用。
   send   <id> [--mode steer|follow_up] [--from claude|user] [--wait] (--text-file 文件 | --stdin | 文本)
          给它发消息：运行中=插话（steer）或追加（follow_up）；已结束=接着原会话续做。
   status [id] [--owner 会话id] [--json] [--limit N]    查看状态
@@ -1502,6 +2340,10 @@ const HELP_ZH = `pisub —— 把 pi 编码代理当后台子代理用
   models [--json]                                     列出 config.json 里的模型别名
   models --pi [搜索词]                                 列出 pi 认识的模型（pi --list-models）
   accounts [reset [提供方]]                            查看/重置轮换池的冷却
+  apply  <id> [--check] [--3way]                      把 --worktree 代理的分支应用到你的工作区
+                                                      （--check 只检查；--3way 合并，冲突处留标记）
+  clean  [id...] [--days N] [--branches] [--dry-run]  删除已结束的运行（默认：早于 keepRunsDays 天的）
+                                                      和它们的 worktree；--branches 连 pi/<id> 分支一起删
   paths                                               输出运行目录等路径（JSON）
   flow run --owner 会话id (--script-file 脚本 | --stdin-json) [--args JSON | --args-file 文件]
            [--resume 旧工作流编号] [--cwd 目录] [--wait] [--json]
@@ -1526,6 +2368,8 @@ const table = {
   models: cmdModels,
   accounts: cmdAccounts,
   flow: cmdFlow,
+  apply: cmdApply,
+  clean: cmdClean,
   _serve: cmdServe,
   _flow: cmdFlowServe,
 };
@@ -1533,6 +2377,7 @@ const HELP = L(HELP_EN, HELP_ZH);
 if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') out(HELP);
 else if (!table[cmd]) die(`${L('unknown command', '不认识的命令')}: ${cmd}\n${HELP}`);
 else {
-  fs.mkdirSync(RUNS, { recursive: true });
+  mkdirp(RUNS);
+  if (process.platform !== 'win32') try { fs.chmodSync(HOME, DIR_MODE); } catch {}
   await table[cmd](rest);
 }

@@ -1,0 +1,140 @@
+#!/usr/bin/env node
+// A stand-in for `pi --mode rpc`, for the broker tests (tests/broker.node-test.mjs). pisub runs it through
+// PI_CLI. It speaks the same JSON-lines protocol, and misbehaves on request.
+//
+// Markers in the prompt text pick what a run does:
+//   [reject]          the prompt is turned down (success: false)
+//   [handled]         the prompt is consumed without a run (disposition "handled")
+//   [slow N]          the run calls a tool that takes N ms (an abort ends it early)
+//   [write F TEXT]    the run writes TEXT into file F of its working directory
+//   [empty]           the final answer has no text
+//   [silent]          the run starts and then sends nothing
+//   [toolhang]        a tool call starts and never ends
+//   [garbage]         prints lines that are not JSON, and never finishes
+//   [bigline]         prints 65 MB without a line break
+//   [exit]            the process dies in the middle of the run
+// The answer is "answer: <prompt without markers>", plus "| steers: a,b" for messages steered in while it ran.
+//
+// Environment:
+//   FAKE_PI=hang-state      never answers get_state
+//   FAKE_PI_ONCE=<file>     the first process (the one that creates <file>) never answers its first prompt
+//   FAKE_PI_ARGV=<file>     appends its command line to <file>, one JSON array per start
+import fs from 'node:fs';
+import path from 'node:path';
+import readline from 'node:readline';
+
+const argv = process.argv.slice(2);
+const opt = name => {
+  const i = argv.indexOf(name);
+  return i >= 0 ? argv[i + 1] : undefined;
+};
+if (process.env.FAKE_PI_ARGV) fs.appendFileSync(process.env.FAKE_PI_ARGV, JSON.stringify(argv) + '\n');
+const modes = new Set((process.env.FAKE_PI || '').split(',').filter(Boolean));
+const sessionDir = opt('--session-dir') || process.cwd();
+fs.mkdirSync(sessionDir, { recursive: true });
+const sessionFile = opt('--session') || path.join(sessionDir, 'fake-session.jsonl');
+fs.appendFileSync(sessionFile, '');
+
+const send = rec => process.stdout.write(JSON.stringify(rec) + '\n');
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const ok = (req, data) => send({ type: 'response', id: req.id, command: req.type, success: true, ...(data !== undefined ? { data } : {}) });
+const fail = (req, error) => send({ type: 'response', id: req.id, command: req.type, success: false, error });
+
+let running = false;
+let aborted = false;
+let steers = [];
+let lastText = '';
+let hungOnce = false;
+
+async function run(message) {
+  running = true;
+  aborted = false;
+  steers = [];
+  send({ type: 'agent_start' });
+  send({ type: 'message_end', message: { role: 'user', content: [{ type: 'text', text: message }] } });
+  if (message.includes('[exit]')) {
+    await sleep(100);
+    process.exit(3);
+  }
+  if (message.includes('[silent]')) return;
+  if (message.includes('[toolhang]')) {
+    send({ type: 'tool_execution_start', toolName: 'bash', args: { command: 'sleep forever' } });
+    return;
+  }
+  if (message.includes('[garbage]')) {
+    for (let i = 0; i < 150; i++) process.stdout.write(`this is not json ${i}\n`);
+    return;
+  }
+  if (message.includes('[bigline]')) {
+    const chunk = 'x'.repeat(1024 * 1024);
+    for (let i = 0; i < 65; i++) await new Promise(r => process.stdout.write(chunk, r));
+    return;
+  }
+  const slow = /\[slow (\d+)\]/.exec(message);
+  if (slow) {
+    send({ type: 'tool_execution_start', toolName: 'bash', args: { command: `sleep ${slow[1]}` } });
+    const t0 = Date.now();
+    while (Date.now() - t0 < Number(slow[1]) && !aborted) await sleep(50);
+    send({ type: 'tool_execution_end', toolName: 'bash', isError: false, durationMs: Date.now() - t0, result: { content: [{ type: 'text', text: 'slept' }] } });
+  }
+  const write = /\[write (\S+) ([^\]]*)\]/.exec(message);
+  if (write) fs.writeFileSync(path.join(process.cwd(), write[1]), write[2]);
+  if (aborted) {
+    send({ type: 'message_end', message: { role: 'assistant', content: [], stopReason: 'aborted' } });
+    running = false;
+    send({ type: 'agent_settled', aborted: true });
+    return;
+  }
+  const clean = message.replace(/\[[^\]]*\]\s*/g, '').trim();
+  lastText = message.includes('[empty]') ? '' : `answer: ${clean}${steers.length ? ` | steers: ${steers.join(',')}` : ''}`;
+  send({ type: 'message_end', message: { role: 'assistant', content: lastText ? [{ type: 'text', text: lastText }] : [], stopReason: 'stop' } });
+  running = false;
+  send({ type: 'agent_settled' });
+}
+
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', line => {
+  let req;
+  try {
+    req = JSON.parse(line);
+  } catch {
+    return;
+  }
+  switch (req.type) {
+    case 'get_state':
+      if (modes.has('hang-state')) return;
+      return ok(req, { sessionFile, model: { provider: 'fake', id: 'fake-model' } });
+    case 'prompt': {
+      const once = process.env.FAKE_PI_ONCE;
+      if (once && !hungOnce && !fs.existsSync(once)) {
+        hungOnce = true;
+        fs.writeFileSync(once, String(process.pid));
+        return; // never answered: the broker is killed while waiting
+      }
+      if (running) return fail(req, 'already running');
+      if (req.message.includes('[reject]')) return fail(req, 'rejected (test)');
+      if (req.message.includes('[handled]')) return ok(req, { disposition: 'handled' });
+      ok(req, { disposition: 'started' });
+      run(req.message);
+      return;
+    }
+    case 'steer':
+    case 'follow_up':
+      if (!running) return fail(req, 'not running');
+      steers.push(req.message);
+      return ok(req);
+    case 'abort':
+      aborted = true;
+      return ok(req);
+    case 'clear_queue':
+    case 'set_model':
+      return ok(req);
+    case 'get_last_assistant_text':
+      return ok(req, { text: lastText });
+    case 'get_session_stats':
+      return ok(req, { tokens: { input: 1, output: 1, total: 2 }, cost: 0, sessionFile });
+    default:
+      return fail(req, `unknown command ${req.type}`);
+  }
+});
+rl.on('close', () => process.exit(0));

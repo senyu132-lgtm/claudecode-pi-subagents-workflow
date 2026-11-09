@@ -8,7 +8,7 @@
 [![Built with Claude Opus 5.5](https://img.shields.io/badge/built%20with-Claude%20Opus%205.5-8A63D2?style=for-the-badge)](https://www.anthropic.com/claude)
 [![Powered by pi](https://img.shields.io/badge/powered%20by-pi-2EA44F?style=for-the-badge)](https://www.npmjs.com/package/@earendil-works/pi-coding-agent)
 <br>
-![Node 18+](https://img.shields.io/badge/node-%E2%89%A518-339933?logo=node.js&logoColor=white)
+![Node 22.19+](https://img.shields.io/badge/node-%E2%89%A522.19-339933?logo=node.js&logoColor=white)
 ![EN · 中文](https://img.shields.io/badge/i18n-EN%20%C2%B7%20%E4%B8%AD%E6%96%87-blue)
 ![MIT](https://img.shields.io/badge/license-MIT-yellow)
 
@@ -33,7 +33,9 @@ So this plugin splits the work. Claude keeps the parts that need its judgment: p
 - **Workflows.** After you type `/pi flow`, Claude can write a short script that runs many agents. The script format follows Claude Code's own Workflow scripts (`agent`, `pipeline`, `parallel`, `phase`), and adds a few things: answers can be checked against a JSON Schema (the agent is asked to redo it if they don't match), `sh()` runs your own check scripts, each model gets its own concurrency limit, and a re-run reuses the results of steps that didn't change.
 - **You can watch and talk to them.** `/pi` opens a panel with all the agents. Click one to see what it's doing right now. Type into it to give it extra instructions, or to make a finished agent continue.
 - **Any model, mixed in one job.** Give your models short names in a config file, for example `brain` for a strong one and `worker` for a cheap one, and use both in the same workflow.
+- **Edits can stay off your files.** With `isolation: 'worktree'` (`--worktree` on the CLI) an agent works in its own git worktree, on a branch of its own. You look at the diff and bring it in with `pisub apply <id>` when you're happy with it, and agents working in parallel can't overwrite each other.
 - **It keeps going.** Every agent runs in its own background process, so it isn't killed when Claude Code restarts. If a provider says you've hit your usage limit, the agent can switch to another account and continue where it stopped. Rate limits and overloads are retried with increasing waits.
+- **Nothing hangs forever.** pi not answering, an agent going silent, a tool call that never ends, a background process that died: each has a time limit, and the agent ends with an error you are told about instead of staying "running".
 - **It costs nothing when you don't use it.** Nothing starts until the first use. The tools are deferred, which means their descriptions aren't even in Claude's context until Claude looks them up.
 - **pi is a good worker for this.** pi starts from a short base prompt and a small set of tools, and by default the plugin runs it without loading your CLAUDE.md or AGENTS.md. Nearly all of its context goes to the task Claude gave it.
 - **English and Chinese.** The CLI, the panel and the notifications can be switched to Chinese with one setting.
@@ -53,7 +55,7 @@ They work fine side by side. Give the work that needs Claude-level judgment to n
 
 ### 1. Install pi and sign in
 
-You need Node.js 18 or newer.
+You need Node.js 22.19 or newer (pi itself requires it).
 
 ```bash
 npm install -g @earendil-works/pi-coding-agent
@@ -113,13 +115,15 @@ Without a config file, pi uses its own default model (the one you last picked in
 Please read this before handing out real work.
 
 - **pi agents don't ask before acting.** pi reads and writes files and runs shell commands with its own tools. Those don't go through Claude Code's permission prompts, permission rules or safety checks, so an agent can change or delete files and run commands without asking you first. Claude Code's permission settings don't apply to it.
-- **Workflows run commands too.** A workflow script has no file or Node APIs of its own, but that is not a security boundary: `sh()` runs real commands on your machine, and every agent the script starts has the same tools as above.
+- **Workflows run commands too.** A workflow script has no file or Node APIs of its own, but that is not a security boundary: `sh()` runs real commands on your machine, and every agent the script starts has the same tools as above. (Only the script's `meta` is read without running anything.)
+- **Answers are data, not instructions.** Final answers reach Claude wrapped and labelled as sub-agent output that can't give permission for anything. That makes it harder for a file an agent read to steer Claude, but it can't rule it out, so keep an eye on what Claude does right after a result comes in.
 - **What you can do about it:**
-  - For jobs that only need to look (reviews, searches, analysis), use read-only mode: Claude can pass `readonly: true`, or use `--readonly` on the CLI. The agent then only gets pi's `read`, `grep`, `find` and `ls` tools.
+  - For jobs that only need to look (reviews, searches, analysis), use read-only mode: Claude can pass `readonly: true`, or use `--readonly` on the CLI. The agent then only gets pi's `read`, `grep`, `find` and `ls` tools, and MCP servers and project-local pi extensions are switched off. This limits tools, not files: a read-only agent can still read anything your user account can.
+  - For jobs that change files, use `isolation: 'worktree'`, so the changes land on a branch you review before applying. This keeps edits off your working tree; it doesn't stop the agent from running commands.
   - Point `cwd` at the folder the job needs rather than your home folder.
   - Work in a git repository and commit before a big job, so you can see and undo what the agents changed.
   - Read workflow scripts before you let them run on anything important. Claude shows the script path when it starts one.
-- **Where your data goes.** Whatever an agent reads is sent to the model provider you set up in pi. The plugin itself has no server and sends nothing anywhere else.
+- **Where your data goes.** Whatever an agent reads is sent to the model provider you set up in pi. The plugin itself has no server and sends nothing anywhere else. Run logs (tasks, transcripts, tool output) are written readable by your user only on macOS and Linux (on Windows your profile folder already is), and finished runs are deleted after `keepRunsDays` days.
 
 ## Configuration
 
@@ -155,6 +159,13 @@ Every setting:
 | `overloadBackoffSec` | Wait times (seconds) between retries when the service is overloaded, after pi's own retries have failed. | `[20,40,80,160,300,300]` |
 | `flowConcurrency` | In workflows, how many agents of each alias may run at once. `default` covers the rest. | `{"default": 4}` |
 | `flowStaggerMs` | In workflows, the minimum gap between starting two agents of the same alias. Helps with providers that dislike bursts. | `{}` |
+| `maxAgents` | The most pi agents running at once on this machine, across every session and workflow. The rest wait for a free slot (shown as "waiting for a slot"). `0` turns the limit off. | `16` |
+| `rpcTimeoutSec` | How long to wait for pi to answer a command before treating it as hung. | `60` |
+| `stallTimeoutMin` | An agent that sends nothing for this many minutes while working (and isn't running a tool) is stopped as hung. `0` turns this off. | `20` |
+| `toolTimeoutMin` | A single tool call that runs longer than this is treated as hung. `0` turns this off. | `120` |
+| `keepRunsDays` | Finished runs older than this are deleted, checked once a day. Branches that hold changes are kept. `0` keeps everything. | `30` |
+
+A `config.json` that isn't valid JSON is reported as an error rather than quietly replaced by the defaults.
 
 **Several accounts for one model (`providers`).** If you have more than one account with a provider, set each up in pi as its own provider (pi's docs on `models.json` and custom providers explain how), then list them under `providers`. When one account hits its usage limit, the agent switches to the next one and carries on. An exhausted account is skipped by every agent until it resets; `pisub accounts` shows which are resting and `pisub accounts reset` clears that.
 
@@ -188,14 +199,30 @@ What's available in a script:
 
 | | |
 |---|---|
-| `agent(prompt, options)` | Runs one pi agent and returns its final answer. Options: `model`, `label` (name shown in the panel), `phase`, `readonly`, `cwd`, `thinking`, `schema`. With `schema`, the answer must be JSON matching it; if it doesn't, the agent is asked to fix it (twice at most). Returns `null` if the agent fails. |
+| `agent(prompt, options)` | Runs one pi agent and returns its final answer. Options: `model`, `label` (name shown in the panel), `phase`, `readonly`, `cwd`, `thinking`, `schema`, plus the ones in the next table. With `schema`, the answer must be JSON matching it; if it doesn't, the agent is asked to fix it (twice at most). Returns `null` if the agent fails or ends without an answer. |
 | `pipeline(items, step1, step2, ...)` | Sends each item through the steps on its own, without waiting for the other items. Each step gets `(previous result, original item, index)`. If a step throws or returns `null`, that item ends as `null`. |
 | `parallel([() => ..., ...])` | Runs everything at once and waits for all of it. Anything that throws becomes `null`. |
-| `sh(command, {cwd, timeoutSec, input})` | Runs a command and returns `{code, stdout, stderr}`. A string runs in bash (Git Bash on Windows); an array like `['python', 'x.py']` runs the program directly. |
+| `sh(command, {cwd, timeoutSec, input, cache})` | Runs a command and returns `{code, stdout, stderr}`. A string runs in bash (Git Bash on Windows); an array like `['python', 'x.py']` runs the program directly. With `cache: true`, a resumed run doesn't run it again if it succeeded last time. |
 | `phase(title)`, `log(text)`, `args` | Mark the current phase, write a line to the workflow log, read the input passed in at start. |
-| `meta` | Name, description and phases. Must be plain values. `meta.concurrency` can override the concurrency limits. |
+| `meta` | Name, description and phases. Must be plain values: it's read, never run. `meta.concurrency` can override the concurrency limits, and `meta.failFast: true` ends the workflow as soon as any agent fails. |
 
-The script runs in a background process. Claude isn't notified about each agent, only once at the end, with whatever the script returns. If you change the script and run it again with `resume`, every `agent()` call whose prompt and options didn't change takes its old result from the cache, and only the changed or new ones run.
+More options for `agent()`:
+
+| | |
+|---|---|
+| `isolation: 'worktree'` | Work in its own git worktree on branch `pi/<id>`, so agents editing in parallel don't overwrite each other or your files. The final summary lists each branch with changes; bring one in with `pisub apply <id>`. |
+| `inputs: 'data/'` or `['a.csv', 'b.csv']` | The files or folders this agent reads. Their content becomes part of the cache key, so a resumed run redoes the agent when they change. |
+| `cache: false` | Always run it, even when resuming. |
+| `retries: n` | If it fails, start it again, up to n times (5 at most). A retry starts from scratch, so the task should be safe to repeat. |
+| `required: true` | If this agent still fails, the whole workflow stops with an error, and so do the agents still running. |
+
+`schema` covers most of JSON Schema 2020-12: types, `enum` and `const`, the number, string, array and object keywords, `allOf`/`anyOf`/`oneOf`/`not`, `if`/`then`/`else` and local `$ref`. A schema that uses anything else (`unevaluatedProperties`, say) is refused when `agent()` is called, rather than checked halfway.
+
+The script runs in a background process. Claude isn't notified about each agent, only once at the end, with whatever the script returns and a summary on top: how many agents ran, which ones failed and why, and which branches have changes. The workflow doesn't finish while an `agent()` or `sh()` it started is still running, even one the script forgot to `await`. If the script throws, the agents it still has running are stopped.
+
+If you change the script and run it again with `resume`, every `agent()` call whose prompt and options didn't change takes its old result from the cache, and only the changed or new ones run. A cached result isn't reused when the files in its `inputs` changed or its model alias now points to a different model. If the repository changed since the old run, the summary says so, because cached results of calls without `inputs` may be out of date. `sh()` calls run again on resume unless they pass `cache: true`.
+
+When several agents that can edit files work in the same folder at the same time, the workflow warns about it. Give them `isolation: 'worktree'`, or `readonly: true` if they only read.
 
 ## Command line
 
@@ -211,6 +238,8 @@ pisub wait <id>                                                  # wait for it a
 pisub stop <id>
 pisub models                                                     # your aliases (--pi lists every model pi knows)
 pisub accounts                                                   # accounts resting after a usage limit
+pisub apply <id>                                                 # bring a --worktree agent's branch into your files (--check tests first)
+pisub clean --days 7                                             # delete finished runs older than a week (--branches also deletes pi/<id> branches)
 pisub help
 ```
 
@@ -222,9 +251,10 @@ Everything lives in `~/.pi-subagents/` (set `PI_SUBAGENTS_HOME` to use another f
 
 - `config.json`: your settings
 - `accounts.json`: accounts currently resting after a usage limit
-- `runs/<id>/`: one folder per agent or workflow, containing `state.json` (status), `task.md` (the task), `view.jsonl` (the condensed log the panel shows), `events.jsonl` (full event stream), `final.md` (final answer), `session/` (pi's own session files), and the logs `serve.log` and `pi-stderr.log`
+- `runs/<id>/`: one folder per agent or workflow, containing `state.json` (status), `task.md` (the task), `view.jsonl` (the condensed log the panel shows), `events.jsonl` (full event stream), `final.md` (final answer), `session/` (pi's own session files), and the logs `serve.log` and `pi-stderr.log`. A workflow also has `journal.jsonl` (its results, for resume); an isolated agent has its worktree in `wt/`.
+- `slots/`: one small file per running agent, for the `maxAgents` limit
 
-Old runs aren't deleted automatically. Delete folders under `runs/` whenever you like.
+Finished runs older than `keepRunsDays` (30 by default) are deleted once a day, and `pisub clean` deletes them whenever you like. Branches that hold changes are kept unless you pass `--branches`.
 
 The plugin has no server of its own. Your code and prompts go only to the model provider you set up in pi.
 
@@ -240,13 +270,19 @@ The plugin has no server of its own. Your code and prompts go only to the model 
 
 **`sh()` fails on Windows.** String commands need bash, which comes with Git for Windows. If it's installed somewhere unusual, set `PISUB_BASH` to the full path of `bash.exe`. Or pass an array, `sh(['python', 'check.py'])`, which doesn't need a shell.
 
-**The panel shows an agent as an error, but it was still working.** If the background process was killed (for example by a reboot), the agent is marked as failed. Send it a message and it continues from its saved session.
+**An agent shows as an error after a reboot or a crash.** If its background process dies, the agent is marked as failed about 15 seconds later, with a final answer saying so, and Claude is told. If messages were still waiting for it, a new background process starts and delivers them instead. Send it a message and it continues from its saved session.
+
+**An agent was stopped as hung.** pi didn't answer a command within `rpcTimeoutSec`, sent nothing for `stallTimeoutMin` minutes, or a tool call ran past `toolTimeoutMin`. If your tasks really take that long, raise those settings.
+
+**An agent says "waiting for a slot".** `maxAgents` agents are already running on this machine. It starts as soon as one finishes.
 
 ## Limitations
 
 - pi can't see your conversation with Claude. Every task has to say what to do, where, and in what format. Claude is instructed to write tasks that way.
 - Results are only as good as the model you choose. Treat answers from cheap models as hints and have a stronger model or Claude check them before you rely on them.
 - Notifications need an interactive Claude Code session (terminal or desktop app).
+- A retry, or an agent continuing after its account switched, may repeat something it had already half done (a file written, a command run). It is told to check what's already done first, but that's up to the model.
+- A worktree only isolates files in the repository. An isolated agent can still run commands that reach anything on your machine.
 - I've mainly used it on Windows 11. macOS and Linux are handled in the code but haven't been tested as much. Issues and pull requests are welcome.
 
 ## Uninstall
@@ -260,12 +296,12 @@ Then delete `~/.pi-subagents/` if you don't want to keep the logs.
 ## Development
 
 ```bash
-node --test tests/flow.node-test.mjs   # the workflow engine
+node --test tests/*.node-test.mjs      # workflow engine, schema validator, and broker tests against a fake pi
 claude plugin test .                   # the plugin, against a simulated Claude Code
 claude plugin validate .
 ```
 
-To try your changes without touching your real data, point `PI_SUBAGENTS_HOME` at a scratch folder.
+To try your changes without touching your real data, point `PI_SUBAGENTS_HOME` at a scratch folder. The broker tests do that by themselves, one temporary folder per test. GitHub Actions runs the node tests on Linux, macOS and Windows.
 
 How the pieces fit together:
 
@@ -285,7 +321,9 @@ flowchart LR
 - `hooks/register.tsx`: the Claude Code side. It registers the tools, draws the panel and sends the notifications.
 - `bin/pisub.mjs`: the CLI and the background process that drives `pi --mode rpc` for each agent, including account switching and retries.
 - `bin/flow.mjs`: the workflow engine: runs the script in its own context (Node's `vm`, which is not a security boundary), handles concurrency, schema checks and the resume cache.
+- `bin/schema.mjs`: the JSON Schema validator for `agent()` answers.
 - `bin/i18n.mjs`: English/Chinese strings.
+- `tests/fake-pi.mjs`: a stand-in for `pi --mode rpc` that misbehaves on request (hangs, garbage output, crashes, endless tool calls), used by `tests/broker.node-test.mjs`.
 
 ## Credits
 
