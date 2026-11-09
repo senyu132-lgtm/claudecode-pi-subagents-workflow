@@ -34,6 +34,7 @@ type World = {
   tools: string[]
   store: Map<string, unknown>
   refuseSubmit?: boolean
+  tries?: number
 }
 
 // No real processes or files in tests: these hooks play the engine and pisub
@@ -90,6 +91,7 @@ function fakeEngine(on: On, lang = 'en'): World {
       .map(p => ({ name: p.slice(RUNS.length + 1, -'/state.json'.length), kind: 'dir' as const, isLink: false, size: 0, mtimeMs: 0 })),
   }))
   on('prompt.submit', (_, e) => {
+    w.tries = (w.tries ?? 0) + 1
     if (w.refuseSubmit) throw new Error('host busy')
     w.submitted.push(e.text)
     return { text: e.text }
@@ -196,7 +198,7 @@ test('spawn passes the session id to pisub and reports only the final answer', a
     const ui = await $.ui.mount({ ...PANE, surface })
     await ui.press({ key: `a-${ID}` })
     await clock.advance(1600)
-    expect(await ui.find({ type: 'Text', text: /→ bash ls/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /Bash\(ls\)/ })).toBeDefined()
     // Each message gives the input a new key, which clears it
     await ui.input({ key: `msg-${i}`, text: 'Check it once more' })
     const sent = w.calls.filter(c => c.argv[2] === 'send')
@@ -287,13 +289,13 @@ test('workflows: no tool and calls refused until /pi flow; then registered and r
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   await ui.press({ key: `a-${WF}` })
   await clock.advance(1600)
-  expect(await ui.find({ type: 'Text', text: /Agents \(1;/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /Analyze/ })).toBeDefined()
   await ui.press({ key: 'c-1' })
   await clock.advance(1600)
   expect(await ui.find({ type: 'Button', key: 'back' })).toBeDefined()
   await ui.press({ key: 'back' })
   await clock.advance(1600)
-  expect(await ui.find({ type: 'Text', text: /Agents \(1;/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /Analyze/ })).toBeDefined()
   await ui.unmount()
 
   await $.command.run({ command: 'pi', args: 'flow off' } as never)
@@ -463,4 +465,192 @@ test('Chinese UI when pisub reports language zh', async ($, on) => {
   expect(w.submitted.length).toBe(1)
   expect(w.submitted[0]).toContain('pi 子代理自动通知')
   await ui.unmount()
+})
+
+const ROW = { tool_use_id: 'toolu_1', tool: 'mcp__pi-subagents__spawn', isRunning: false, isErrored: false, isInterrupted: false }
+
+test('the spawn call is drawn like a sub-agent: its last tool calls while it runs, one summary line when done', async ($, on) => {
+  const w = fakeEngine(on)
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/w', surface: 'desktop', isInteractive: true })
+  const r = await $.tool.call({ tool: 'mcp__pi-subagents__spawn', tool_use_id: 'toolu_1', task: 'Count the rows in sales.csv', model: 'strong', name: 'Row count' } as never)
+  const output = r.text ?? String(r.result)
+  w.files[`${RUNS}/${ID}/state.json`] = JSON.stringify({ ...JSON.parse(state(ID, 'running', 0)), name: 'Row count' })
+  w.files[`${RUNS}/${ID}/live.json`] = JSON.stringify({
+    tools: 5,
+    recent: [{ name: 'read', args: 'sales.csv' }, { name: 'bash', args: 'wc -l sales.csv' }, { name: 'bash', args: 'head -3 sales.csv' }],
+  })
+  await clock.advance(1600)
+  const props = { ...ROW, input: { task: 'Count the rows in sales.csv', model: 'strong', name: 'Row count' }, output }
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ plugin: 'pi-subagents', component: 'ToolUse', requestId: 'toolu_1', props, surface })
+    expect(await ui.find({ type: 'Text', text: /pi\(Row count\) strong/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /Bash\(wc -l sales\.csv\)/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /\+2 more tool uses/ })).toBeDefined()
+    await ui.unmount()
+  }
+
+  // Done: one line, as Claude Code ends a sub-agent's row
+  w.mtime += 1
+  w.files[`${RUNS}/${ID}/state.json`] = JSON.stringify({ ...JSON.parse(state(ID, 'done', 1)), name: 'Row count', toolUses: 8, createdAt: 1000, finishedAt: 63000 })
+  w.files[`${RUNS}/${ID}/final.md`] = '1204 rows'
+  await clock.advance(1600)
+  const ui = await $.ui.mount({ plugin: 'pi-subagents', component: 'ToolUse', requestId: 'toolu_1', props, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /Done \(8 tool uses · 1m 2s\)/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /more tool uses/ })).toBeUndefined()
+  // "view" opens the pane on this agent
+  await ui.press({ key: 'open' })
+  await ui.unmount()
+  const pane = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await pane.find({ type: 'Button', key: 'back' })).toBeDefined()
+  await pane.unmount()
+
+  // The result row under it draws nothing: the row above already says it all
+  const res = await $.ui.mount({ plugin: 'pi-subagents', component: 'ToolResult', requestId: 'toolu_1', props: { tool_use_id: 'toolu_1', tool: 'mcp__pi-subagents__spawn', output, isErrored: false }, surface: 'terminal' })
+  expect(await res.find({ type: 'Text' })).toBeUndefined()
+  await res.unmount()
+
+  // A row drawn after a restart, with the call-to-agent map gone, finds its agent in the result text
+  const again = await $.ui.mount({ plugin: 'pi-subagents', component: 'ToolUse', requestId: 'toolu_9', props: { ...props, tool_use_id: 'toolu_9' }, surface: 'terminal' })
+  expect(await again.find({ type: 'Text', text: /Done \(8 tool uses/ })).toBeDefined()
+  await again.unmount()
+})
+
+test('the completion notice is drawn as one line per agent; the model still reads the whole text', async ($, on) => {
+  const w = fakeEngine(on)
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/w', surface: 'desktop', isInteractive: true })
+  await $.tool.call({ tool: 'mcp__pi-subagents__spawn', task: 'Count the rows in sales.csv' } as never)
+  w.files[`${RUNS}/${ID}/state.json`] = state(ID, 'running', 0)
+  await clock.advance(1600)
+  w.mtime += 1
+  w.files[`${RUNS}/${ID}/state.json`] = JSON.stringify({ ...JSON.parse(state(ID, 'done', 1)), toolUses: 3, finishedAt: 21001 })
+  w.files[`${RUNS}/${ID}/final.md`] = 'Final answer: 1204 rows.'
+  await clock.advance(6000)
+  expect(w.submitted.length).toBe(1)
+  expect(w.submitted[0]).toContain('Final answer: 1204 rows.')
+  const props = { text: w.submitted[0]!, origin: { kind: 'plugin', name: 'pi-subagents' }, isExpanded: false } as never
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ plugin: 'pi-subagents', component: 'UserMessage', requestId: 'm1', props, surface })
+    expect(await ui.find({ type: 'Text', text: /pi\(Count the rows in sales\.csv\)/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /Done \(3 tool uses · 21s\)/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /Final answer/ })).toBeUndefined()
+    await ui.unmount()
+  }
+})
+
+test('a line above the prompt while this session has agents running, gone when they finish', async ($, on) => {
+  const w = fakeEngine(on)
+  const clock = mock.clock(on)
+  // Stands for the engine's own band beneath the plugin
+  on('ui.render', { component: 'AbovePrompt' }, ($, e) => {
+    const { Text } = $.ui.resolve(e)
+    return <Text>engine band</Text>
+  })
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  const BAND = { plugin: 'pi-subagents', component: 'AbovePrompt', requestId: 'band', props: { hasSurvey: false, isWorking: false, maxRows: 10, bodyColumns: 80, scroll: { offset: 0, bodyRows: 10 }, view: {} } } as never
+  const idle = await $.ui.mount({ ...(BAND as object), surface: 'terminal' } as never)
+  expect(await idle.find({ type: 'Text', text: /pi agent/ })).toBeUndefined()
+  expect(await idle.find({ type: 'Text', text: /engine band/ })).toBeDefined()
+  await idle.unmount()
+
+  await $.tool.call({ tool: 'mcp__pi-subagents__spawn', task: 'Count the rows in sales.csv' } as never)
+  w.files[`${RUNS}/${ID}/state.json`] = state(ID, 'running', 0)
+  await clock.advance(1600)
+  const ui = await $.ui.mount({ ...(BAND as object), surface: 'terminal' } as never)
+  expect(await ui.find({ type: 'Text', text: /1 pi agent running/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /engine band/ })).toBeDefined()
+  finish(w, ID, 'done')
+  await clock.advance(1600)
+  expect(await ui.find({ type: 'Text', text: /pi agent/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test("the earlier lines of an agent's record open with one press, and fold back", async ($, on) => {
+  const w = fakeEngine(on)
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  await $.tool.call({ tool: 'mcp__pi-subagents__spawn', task: 'x' } as never)
+  w.files[`${RUNS}/${ID}/state.json`] = state(ID, 'running', 0)
+  w.files[`${RUNS}/${ID}/view.jsonl`] = Array.from({ length: 40 }, (_, i) => JSON.stringify({ t: i, k: 'text', text: `step ${i + 1} done` })).join('\n') + '\n'
+  const small = { ...PANE, props: { ...PANE.props, scroll: { offset: 0, bodyRows: 12 } } }
+  const ui = await $.ui.mount({ ...small, surface: 'terminal' })
+  await clock.advance(1600)
+  await ui.press({ key: `a-${ID}` })
+  await clock.advance(1600)
+  expect(await ui.find({ type: 'Text', text: /step 40 done/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /step 1 done/ })).toBeUndefined()
+  expect((await ui.find({ type: 'Button', key: 'more' }))?.text).toMatch(/earlier lines, show them/)
+  await ui.press({ key: 'more' })
+  expect(await ui.find({ type: 'Text', text: /step 1 done/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /step 40 done/ })).toBeDefined()
+  expect(await ui.find({ type: 'Button', key: 'more' })).toBeUndefined()
+  await ui.press({ key: 'less' })
+  expect(await ui.find({ type: 'Text', text: /step 1 done/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Button', key: 'more' })).toBeDefined()
+  // Opening another view starts folded again
+  await ui.press({ key: 'more' })
+  await ui.press({ key: 'back' })
+  await ui.press({ key: `a-${ID}` })
+  await clock.advance(1600)
+  expect(await ui.find({ type: 'Text', text: /step 1 done/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test("the desktop has no ctrl+o: an expanded notice is still one line there; ctrl+o on the terminal shows it all", async ($, on) => {
+  const w = fakeEngine(on)
+  const clock = mock.clock(on)
+  // Stands for the engine's own drawing of the row
+  on('ui.render', { component: 'UserMessage' }, ($, e) => {
+    const { Text } = $.ui.resolve(e)
+    return <Text>{e.props.text}</Text>
+  })
+  await $.session.start({ cwd: '/w', surface: 'desktop', isInteractive: true })
+  await $.tool.call({ tool: 'mcp__pi-subagents__spawn', task: 'Count the rows in sales.csv' } as never)
+  w.files[`${RUNS}/${ID}/state.json`] = state(ID, 'running', 0)
+  await clock.advance(1600)
+  finish(w, ID, 'Final answer: 1204 rows.')
+  await clock.advance(6000)
+  expect(w.submitted.length).toBe(1)
+  const props = { text: w.submitted[0]!, origin: { kind: 'plugin', name: 'pi-subagents' }, isExpanded: true } as never
+  const desk = await $.ui.mount({ plugin: 'pi-subagents', component: 'UserMessage', requestId: 'm1', props, surface: 'desktop' })
+  expect(await desk.find({ type: 'Text', text: /1204 rows/ })).toBeUndefined()
+  expect(await desk.find({ type: 'Button', key: `v-${ID}` })).toBeDefined()
+  await desk.unmount()
+  const term = await $.ui.mount({ plugin: 'pi-subagents', component: 'UserMessage', requestId: 'm1', props, surface: 'terminal' })
+  expect(await term.find({ type: 'Text', text: /1204 rows/ })).toBeDefined()
+  await term.unmount()
+})
+
+test('a notification the host keeps refusing is tried less and less often, then sent', async ($, on) => {
+  const w = fakeEngine(on)
+  w.refuseSubmit = true
+  const clock = mock.clock(on)
+  seedSession(w, [ID])
+  finish(w, ID, 'Final answer: 7.')
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  for (let i = 0; i < 40; i++) await clock.advance(1500)
+  // A minute of polls every 1.5 s: without backing off that would be over 30 tries
+  expect(w.tries ?? 0).toBeGreaterThan(2)
+  expect(w.tries ?? 0).toBeLessThanOrEqual(8)
+  w.refuseSubmit = false
+  for (let i = 0; i < 45; i++) await clock.advance(1500)
+  expect(w.submitted.length).toBe(1)
+  expect(w.submitted[0]).toContain('Final answer: 7.')
+})
+
+test('a result whose state cannot be read yet stays pending and is sent once it can be', async ($, on) => {
+  const w = fakeEngine(on)
+  const clock = mock.clock(on)
+  const LATE = 'late-1109-120009-zzz'
+  w.store.set('notify:sid-test', { at: Date.now(), mine: [LATE], notified: { [LATE]: 1 }, pending: [LATE] })
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  for (let i = 0; i < 12; i++) await clock.advance(1600)
+  expect(w.submitted.length).toBe(0)
+  expect((w.store.get('notify:sid-test') as { pending: string[] }).pending).toEqual([LATE])
+  finish(w, LATE, 'Final answer: late but here.')
+  await clock.advance(1600)
+  await clock.advance(1600)
+  expect(w.submitted.length).toBe(1)
+  expect(w.submitted[0]).toContain('late but here')
 })

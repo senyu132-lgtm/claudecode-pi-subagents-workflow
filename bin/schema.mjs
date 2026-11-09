@@ -44,7 +44,18 @@ function resolve(root, ref) {
 export function checkSchema(schema) {
   const visited = new WeakSet();
   const fail = (at, en, zh = en) => L(`${at}: ${en}`, `${at}：${zh}`);
+  // validate() stops at 200 levels; a schema nested deeper than that is refused here, as a message
+  let depth = 0;
   function walk(s, at) {
+    if (depth >= 200) return fail(at, 'nested more than 200 levels deep', '嵌套超过 200 层');
+    depth++;
+    try {
+      return walkOne(s, at);
+    } finally {
+      depth--;
+    }
+  }
+  function walkOne(s, at) {
     if (!isSchema(s)) return fail(at, 'expected a schema (an object or a boolean)', '这里应该是模式（对象或布尔值）');
     if (typeof s === 'boolean') return null;
     if (visited.has(s)) return null;

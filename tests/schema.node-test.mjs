@@ -128,3 +128,13 @@ test('flow regression', () => {
   assert.match(validate(s, { ok: true, z: 1 }), /must not have field z/);
   assert.match(validate(s, { ok: true, kind: 'q' }), /one of/);
 });
+
+test('a schema nested too deeply is refused with a message, not a crash', () => {
+  setLanguage('en');
+  let deep = { type: 'string' };
+  for (let i = 0; i < 5000; i++) deep = { items: deep };
+  assert.match(checkSchema(deep), /nested more than 200 levels deep/);
+  let fine = { type: 'string' };
+  for (let i = 0; i < 150; i++) fine = { items: fine };
+  assert.equal(checkSchema(fine), null);
+});

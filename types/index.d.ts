@@ -20,6 +20,13 @@ export type AgentRow = {
   parent: string
   // Workflows: how many of its agents failed
   failed: number
+  // Tool calls over the agent's life (as of its last finished round), and when it last finished
+  toolUses: number
+  finishedAt: number
+  // Workflows: the phase titles from meta, the current phase, and its agents
+  phases: string[]
+  phase: string
+  kids: FlowChild[]
 }
 
 export type FlowChild = { index: number; label: string; phase: string; model: string; status: string; id: string; note: string }
@@ -46,6 +53,8 @@ export type ViewEntry = {
 }
 
 export type Live = { text: string; thinking: string; tool: string }
+// A running agent's tool calls so far and its last few, for its transcript row
+export type Activity = { tools: number; recent: { name: string; args: string }[]; now: string }
 
 export type Detail = { id: string; entries: ViewEntry[]; live: Live; children: FlowChild[] }
 
@@ -61,7 +70,10 @@ declare module 'claude-code' {
       detail: Shaped<Detail | null>
       notice: string
       sendCount: number
+      expanded: boolean
       flowOn: boolean
+      activity: Shaped<Record<string, Activity>>
+      calls: Shaped<Record<string, string>>
     }
   }
 }

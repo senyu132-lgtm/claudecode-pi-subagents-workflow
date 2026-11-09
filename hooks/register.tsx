@@ -11,15 +11,15 @@
 //   phases and every agent
 // The real work happens in bin/pisub.mjs (one detached broker process per agent).
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { ElementConstructor, EngineInterface, Register, TextProps } from 'claude-code'
 
-import type { AgentRow, Detail, FlowChild, Live, ViewEntry } from '../types'
+import type { Activity, AgentRow, Detail, FlowChild, Live, ViewEntry } from '../types'
 
 const P = 'pi-subagents'
 const PANE = 'pi-subagents'
 const toolName = (n: string) => `mcp__${P}__${n}`
 
-const agentsA = atom({ plugin: 'pi-subagents', key: 'agents' } as const, [] as AgentRow[], { shape: 'agents-3' })
+const agentsA = atom({ plugin: 'pi-subagents', key: 'agents' } as const, [] as AgentRow[], { shape: 'agents-4' })
 const mineA = atom({ plugin: 'pi-subagents', key: 'mine' } as const, [] as string[], { shape: 'mine-1' })
 const notifiedA = atom({ plugin: 'pi-subagents', key: 'notified' } as const, {} as Record<string, number>, { shape: 'notified-1' })
 // Agents that finished but have not been reported yet
@@ -29,14 +29,20 @@ const showAllA = atom({ plugin: 'pi-subagents', key: 'showAll' } as const, false
 const detailA = atom({ plugin: 'pi-subagents', key: 'detail' } as const, null as Detail | null, { shape: 'detail-2' })
 const noticeA = atom({ plugin: 'pi-subagents', key: 'notice' } as const, '')
 const sendCountA = atom({ plugin: 'pi-subagents', key: 'sendCount' } as const, 0)
+// The detail view shows the agent's whole record (the pane scrolls) instead of the last lines that fit
+const expandA = atom({ plugin: 'pi-subagents', key: 'expanded' } as const, false)
 // Whether the user turned workflows on in this session (/pi flow)
 const flowOnA = atom({ plugin: 'pi-subagents', key: 'flowOn' } as const, false)
+// What this session's running agents are doing (tool call count, last calls), for their transcript rows
+const activityA = atom({ plugin: 'pi-subagents', key: 'activity' } as const, {} as Record<string, Activity>, { shape: 'activity-1' })
+// Which agent each spawn or flow call started (tool_use_id → agent id), so its transcript row can follow it
+const callsA = atom({ plugin: 'pi-subagents', key: 'calls' } as const, {} as Record<string, string>, { shape: 'calls-1' })
 
 const TERMINAL = new Set(['done', 'error', 'stopped'])
 const ICON: Record<string, string> = { starting: '◌', queued: '◷', running: '●', retrying: '↻', waiting: '…', done: '✓', error: '✗', stopped: '■' }
-// One notification stays within MAX_NOTIFY characters however many results land at once: up to INLINE_MAX
-// answers are included (each cut to fit, with a marker), the rest are listed by id to fetch with the result tool
-const MAX_NOTIFY = 60000
+// One notification stays bounded however many results land at once: the answers share INLINE_BUDGET characters
+// (each at least INLINE_MIN, cut to fit with a marker), so at most INLINE_BUDGET / INLINE_MIN of them are
+// included; the rest are listed by id (at most MAX_LISTED) to fetch with the result tool
 const INLINE_BUDGET = 45000
 const INLINE_MIN = 1500
 const MAX_LISTED = 40
@@ -54,13 +60,16 @@ type Sess = {
   lastAddedAt: number
   firstPendingAt: number
   checked: Map<string, number> // when a silent agent was last checked for a dead broker
+  failures: number // notifications in a row the host did not take
+  retryAt: number // not before then, after such a failure
+  misses: Map<string, number> // pending results whose state could not be read, and how often
 }
 const sessions = new Map<string, Sess>()
 async function sess($: EngineInterface): Promise<Sess> {
   const sid = await $.session.id()
   let s = sessions.get(sid)
   if (!s) {
-    s = { ctx: null, active: false, polling: false, mainBusy: false, submitting: false, lastAddedAt: 0, firstPendingAt: 0, checked: new Map() }
+    s = { ctx: null, active: false, polling: false, mainBusy: false, submitting: false, lastAddedAt: 0, firstPendingAt: 0, checked: new Map(), failures: 0, retryAt: 0, misses: new Map() }
     sessions.set(sid, s)
   }
   return s
@@ -152,6 +161,13 @@ function toRow(s: Record<string, unknown>): AgentRow {
     progress: str(s.progress),
     parent: str(s.parent),
     failed: num(s.failed),
+    toolUses: num(s.toolUses),
+    finishedAt: num(s.finishedAt),
+    phases: Array.isArray(s.phases)
+      ? s.phases.map(x => (typeof x === 'string' ? x : x && typeof (x as { title?: unknown }).title === 'string' ? (x as { title: string }).title : '')).filter(Boolean)
+      : [],
+    phase: str(s.currentPhase),
+    kids: s.kind === 'flow' ? toChildren(s.children) : [],
   }
 }
 
@@ -216,6 +232,23 @@ async function poll($: EngineInterface) {
     const before = await read($, agentsA)
     if (JSON.stringify(before) !== JSON.stringify(shown)) await update($, agentsA, () => shown)
 
+    // What this session's running agents are doing, for their rows in the transcript and the pane
+    const act: Record<string, Activity> = {}
+    for (const r of rows) {
+      if (!mine.includes(r.id) || TERMINAL.has(r.status) || r.kind === 'flow') continue
+      try {
+        const l = JSON.parse(await $.fs.read(`${c.runs}/${r.id}/live.json`)) as Partial<Live> & { tools?: number; recent?: { name?: string; args?: string }[] }
+        act[r.id] = {
+          tools: typeof l.tools === 'number' ? l.tools : 0,
+          recent: Array.isArray(l.recent) ? l.recent.map(x => ({ name: String(x?.name || ''), args: String(x?.args || '') })) : [],
+          now: l.tool ? 'tool' : l.text ? 'writing' : l.thinking ? 'thinking' : '',
+        }
+      } catch {
+        act[r.id] = { tools: r.toolUses, recent: [], now: '' }
+      }
+    }
+    if (JSON.stringify(act) !== JSON.stringify(await read($, activityA))) await update($, activityA, () => act)
+
     // An agent of this session that looks busy but whose broker is gone: let pisub settle it (restart it, or
     // record the failure), so the session is told instead of waiting forever
     for (const r of rows) if (mine.includes(r.id) && !TERMINAL.has(r.status)) await checkLost($, c, s, r)
@@ -274,10 +307,24 @@ async function flushNotifications($: EngineInterface, c: Ctx, s: Sess) {
   const t = await $.clock.now()
   // Wait for a quiet moment so results that land together share one notification, but not forever
   if (t - s.lastAddedAt < BATCH_MS && t - (s.firstPendingAt || t) < MAX_WAIT_MS) return
+  if (t < s.retryAt) return
   const rows: AgentRow[] = []
+  // Results whose state cannot be read stay pending for a later try; only after many tries are they given up
+  const unread: string[] = []
   for (const id of pending) {
     const row = await loadRow($, c.runs, id)
-    if (row) rows.push(row)
+    if (row) {
+      rows.push(row)
+      s.misses.delete(id)
+      continue
+    }
+    const n = (s.misses.get(id) ?? 0) + 1
+    s.misses.set(id, n)
+    if (n < 20) unread.push(id)
+    else {
+      s.misses.delete(id)
+      $.ui.log(`${P}: gave up notifying ${id}: its state could not be read`, { to: 'debug' })
+    }
   }
   const inline = rows.slice(0, Math.floor(INLINE_BUDGET / INLINE_MIN))
   const each = Math.floor(INLINE_BUDGET / Math.max(1, inline.length))
@@ -323,12 +370,11 @@ async function flushNotifications($: EngineInterface, c: Ctx, s: Sess) {
             `${rows.length} 个代理有新结果：${rows.slice(0, 20).map(r => `${r.name || r.id}（${outcome(r)}）`).join('、')}${rows.length > 20 ? '……' : ''}`,
           )
   const done = async () => {
-    await update($, pendingA, list => list.filter(id => !pending.includes(id)))
-    s.firstPendingAt = 0
+    await update($, pendingA, list => list.filter(id => !pending.includes(id) || unread.includes(id)))
+    s.firstPendingAt = unread.length ? t : 0
     await persist($)
   }
   if (rows.length === 0) return done()
-  $.ui.toast(`${title()}: ${head}`)
   const text =
     L(
       `[pi sub-agent notification, not a user message] ${head}. Only the final answers are below; ` +
@@ -343,7 +389,13 @@ async function flushNotifications($: EngineInterface, c: Ctx, s: Sess) {
     await $.prompt.submit({ text })
     // Only now are they reported; until here they stay pending (and stored), so a crash cannot lose them
     await done()
+    s.failures = 0
+    s.retryAt = 0
+    $.ui.toast(`${title()}: ${head}`)
   } catch (err) {
+    // Try again later, waiting longer each time (1.5 s, 3 s, 6 s, … up to a minute)
+    s.failures++
+    s.retryAt = t + Math.min(60000, 1500 * 2 ** (s.failures - 1))
     $.ui.log(`${P}: notification not delivered, will retry: ${String(err)}`, { to: 'debug' })
   } finally {
     s.submitting = false
@@ -404,10 +456,16 @@ async function adopt($: EngineInterface, id: string, onlyIfFinished = false) {
   await persist($)
 }
 
+async function remember($: EngineInterface, call: unknown, id: string) {
+  const useId = (call as { tool_use_id?: unknown }).tool_use_id
+  if (typeof useId === 'string' && useId) await update($, callsA, m => ({ ...m, [useId]: id }))
+}
+
 async function select($: EngineInterface, id: string) {
   detailSig = ''
   await update($, selectedA, () => id)
   await update($, noticeA, () => '')
+  await update($, expandA, () => false)
   if (!id) await update($, detailA, () => null)
   void poll($)
 }
@@ -418,6 +476,7 @@ async function openPane($: EngineInterface, focus = false) {
 }
 
 // ---------- drawing helpers ----------
+// The look follows Claude Code's own transcript: a status dot, `Tool(args)`, and `⎿` result lines under it.
 function cells(s: string) {
   let n = 0
   for (const ch of s) n += ch.codePointAt(0)! > 0x2e80 ? 2 : 1
@@ -430,6 +489,7 @@ function cut(s: string | undefined, n: number) {
   const t = (s || '').trim()
   return t.length > n ? t.slice(0, n) + '…' : t
 }
+const oneLine = (s: string | undefined, n: number) => cut((s || '').replace(/\s+/g, ' '), n)
 function ago(t: number) {
   const s = Math.max(0, Math.round((Date.now() - t) / 1000))
   if (s < 60) return L(`${s}s ago`, `${s}秒前`)
@@ -437,52 +497,216 @@ function ago(t: number) {
   if (s < 86400) return L(`${Math.round(s / 3600)}h ago`, `${Math.round(s / 3600)}小时前`)
   return L(`${Math.round(s / 86400)}d ago`, `${Math.round(s / 86400)}天前`)
 }
-type Line = { text: string; color?: string; dim?: boolean; bold?: boolean }
-const CHILD_ICON: Record<string, string> = { running: '●', done: '✓', error: '✗', cached: '≡' }
-function linesOf(e: ViewEntry): Line {
-  switch (e.k) {
-    case 'user': {
-      const from: Record<string, string> = { claude: 'Claude', user: L('You', '你'), system: L('System', '系统') }
-      const tag = `${from[e.from || ''] || e.from}${e.mode === 'steer' ? L('·steer', '·插话') : e.mode === 'follow_up' ? L('·follow-up', '·追加') : ''}`
-      return { text: `${L(`[${tag}] `, `【${tag}】`)}${cut(e.text, 600)}`, bold: true }
-    }
-    case 'thinking':
-      return { text: `${L('(thinking) ', '（思考）')}${cut(e.text, 200)}`, dim: true }
-    case 'text':
-      return { text: cut(e.text, 3000) }
-    case 'tool':
-      return { text: `→ ${e.name} ${cut(e.args, 160)}`, color: 'subtle' }
-    case 'tool_end':
-      return {
-        text: `${e.ok ? '✓' : '✗'} ${e.name}${e.ms != null ? ` ${(e.ms / 1000).toFixed(1)}s` : ''}  ${cut((e.out || '').split('\n').slice(0, 2).join(' ⏎ '), 160)}`,
-        color: e.ok ? undefined : 'error',
-        dim: !!e.ok,
-      }
-    case 'error':
-      return { text: `！${cut(e.text, 600)}`, color: 'error' }
-    case 'retry':
-      return { text: `↻ ${cut(e.text, 300)}`, color: 'warning' }
-    case 'done':
-      return {
-        text: `──── ${L(`round ${e.round} ended: ${statusName(e.status || '')}`, `第 ${e.round} 轮结束：${statusName(e.status || '')}`)} ────`,
-        color: e.status === 'done' ? 'success' : 'warning',
-      }
-    case 'phase':
-      return { text: `══ ${L('phase', '阶段')}: ${e.text} ══`, bold: true }
-    case 'agent': {
-      const evs: Record<string, string> = { start: '▶', done: '✓', error: '✗', cached: L('≡ cached', '≡ 缓存'), retry: L('↻ resubmit', '↻ 重交') }
-      const ev = evs[e.ev || ''] || e.ev
-      return {
-        text: `${ev} ${e.label} ${L(`(${e.model})`, `（${e.model}）`)}${e.text ? ': ' + cut(e.text, 200) : ''}`,
-        color: e.ev === 'error' ? 'error' : e.ev === 'retry' ? 'warning' : undefined,
-        dim: e.ev === 'start' || e.ev === 'cached',
-      }
-    }
-    case 'sh':
-      return { text: `$ ${cut(e.text, 160)} → ${e.code}`, color: e.code === 0 ? 'subtle' : 'warning' }
-    default:
-      return { text: `· ${cut(e.text, 300)}`, dim: true }
+function dur(ms: number) {
+  const s = Math.max(0, Math.round(ms / 1000))
+  if (s < 60) return L(`${s}s`, `${s}秒`)
+  const m = Math.floor(s / 60)
+  if (m < 60) return L(`${m}m ${s % 60}s`, `${m}分${s % 60}秒`)
+  return L(`${Math.floor(m / 60)}h ${m % 60}m`, `${Math.floor(m / 60)}小时${m % 60}分`)
+}
+const toolCount = (n: number) => L(`${n} tool ${n === 1 ? 'use' : 'uses'}`, `${n} 次工具调用`)
+const cap = (s: string) => (s ? s[0]!.toUpperCase() + s.slice(1) : s)
+// `Bash(ls data/)`, as Claude Code writes a tool call
+const callText = (name: string, args: string | undefined, n: number) => `${cap(name || 'tool')}(${oneLine(args, n)})`
+
+type Dot = { glyph: string; color?: string; dim?: boolean }
+function dotOf(status: string): Dot {
+  if (status === 'done' || status === 'cached') return { glyph: '●', color: 'success' }
+  if (status === 'error') return { glyph: '●', color: 'error' }
+  if (status === 'stopped' || status === 'retrying' || status === 'waiting') return { glyph: '●', color: 'warning' }
+  if (status === 'queued' || status === 'pending' || status === 'todo') return { glyph: '○', dim: true }
+  return { glyph: '●', dim: true } // starting, running
+}
+const nameOf = (r: AgentRow) => r.name || oneLine(r.task, 48) || r.id
+// The model as a short label: the alias it was started with, else the model id without its provider
+const shortModel = (r: AgentRow) => (r.kind === 'flow' ? '' : r.alias || r.model.split('/').pop() || L('pi default', 'pi 默认'))
+const flowCounts = (kids: FlowChild[]) => ({
+  done: kids.filter(k => k.status === 'done' || k.status === 'cached').length,
+  failed: kids.filter(k => k.status === 'error').length,
+  running: kids.filter(k => k.status === 'running').length,
+})
+function phaseText(r: AgentRow) {
+  if (!r.phase) return ''
+  const i = r.phases.indexOf(r.phase)
+  return i >= 0 ? L(`Phase ${i + 1}/${r.phases.length}: ${r.phase}`, `阶段 ${i + 1}/${r.phases.length}：${r.phase}`) : r.phase
+}
+// One line saying how a finished agent or workflow ended: `Done (8 tool uses · 1m 12s)`
+function endLine(r: AgentRow): Line {
+  const parts: string[] = []
+  if (r.kind === 'flow') {
+    const k = flowCounts(r.kids)
+    parts.push(L(`${r.kids.length} ${r.kids.length === 1 ? 'agent' : 'agents'}`, `${r.kids.length} 个代理`))
+    if (k.failed) parts.push(L(`${k.failed} failed`, `${k.failed} 个失败`))
+  } else {
+    if (r.rounds > 1) parts.push(L(`${r.rounds} rounds`, `${r.rounds} 轮`))
+    parts.push(toolCount(r.toolUses))
   }
+  // A resumed agent's clock would count the idle time between rounds: only the first round is timed
+  if (r.rounds <= 1 && r.createdAt && r.finishedAt > r.createdAt) parts.push(dur(r.finishedAt - r.createdAt))
+  const word = r.status === 'done' ? L('Done', '完成') : r.status === 'error' ? L('Error', '出错') : L('Stopped', '已停止')
+  const why = r.status !== 'done' && r.lastError ? L(`: ${oneLine(r.lastError, 160)}`, `：${oneLine(r.lastError, 160)}`) : ''
+  return { text: L(`${word} (${parts.join(' · ')})`, `${word}（${parts.join(' · ')}）`) + why, color: r.status === 'error' ? 'error' : r.status === 'stopped' ? 'warning' : undefined, dim: r.status === 'done' }
+}
+// What a running agent is doing: its last tool calls, as Claude Code shows a running sub-agent
+function workLines(r: AgentRow, act: Activity | undefined): Line[] {
+  if (r.kind === 'flow') {
+    const k = flowCounts(r.kids)
+    const head = [phaseText(r), L(`${k.done}/${r.kids.length} done`, `完成 ${k.done}/${r.kids.length}`), k.failed ? L(`${k.failed} failed`, `${k.failed} 个失败`) : '']
+      .filter(Boolean)
+      .join(' · ')
+    const out: Line[] = [{ text: head || L('Starting…', '启动中…'), dim: true }]
+    const busy = r.kids.filter(c => c.status === 'running')
+    for (const c of busy.slice(0, 3)) out.push({ text: `${c.label}${c.model ? ` · ${c.model}` : ''}`, dim: true, dot: { glyph: '●', dim: true } })
+    if (busy.length > 3) out.push({ text: L(`+${busy.length - 3} more running`, `还有 ${busy.length - 3} 个在跑`), dim: true })
+    return out
+  }
+  if (r.status === 'queued') return [{ text: L('Waiting for a free slot…', '排队等空位…'), dim: true }]
+  if (r.status === 'retrying' || r.status === 'waiting') return [{ text: r.lastError ? oneLine(r.lastError, 120) : statusName(r.status), color: 'warning' }]
+  if (!act || act.recent.length === 0) return [{ text: act?.now === 'thinking' ? L('Thinking…', '思考中…') : L('Starting…', '启动中…'), dim: true }]
+  const out: Line[] = act.recent.map(t => ({ text: callText(t.name, t.args, 90), dim: true }))
+  const more = act.tools - act.recent.length
+  if (more > 0) out.push({ text: L(`+${more} more tool ${more === 1 ? 'use' : 'uses'}`, `还有 ${more} 次工具调用`), dim: true })
+  return out
+}
+
+// One line for a list: the latest tool call and the count so far
+function nowDoing(r: AgentRow, act: Activity | undefined) {
+  const last = act?.recent.at(-1)
+  return last ? `${callText(last.name, last.args, 50)} · ${toolCount(act!.tools)}` : workLines(r, act)[0]?.text || ''
+}
+
+type Line = { text: string; meta?: string; color?: string; dim?: boolean; bold?: boolean; italic?: boolean; dot?: Dot; under?: boolean }
+// The agent's record, drawn like Claude Code's transcript: `> prompt`, `● text`, `● Bash(cmd)` with `⎿ output`
+function transcript(entries: ViewEntry[]): Line[] {
+  const out: Line[] = []
+  const open: { name: string; at: number }[] = [] // tool calls still waiting for their end, by line index
+  for (const e of entries) {
+    switch (e.k) {
+      case 'user': {
+        const tag =
+          e.from === 'user'
+            ? L('you', '你')
+            : e.from === 'system'
+              ? L('system', '系统')
+              : e.mode === 'steer' || e.mode === 'follow_up'
+                ? 'Claude'
+                : ''
+        const mode = e.mode === 'steer' ? L(' · steer', ' · 插话') : e.mode === 'follow_up' ? L(' · follow-up', ' · 追加') : ''
+        out.push({ text: `> ${tag ? `(${tag}${mode}) ` : ''}${cut(e.text, 600)}`, color: 'subtle' })
+        break
+      }
+      case 'thinking':
+        out.push({ text: `∴ ${oneLine(e.text, 200)}`, dim: true, italic: true })
+        break
+      case 'text':
+        out.push({ text: cut(e.text, 3000), dot: { glyph: '●' } })
+        break
+      case 'tool':
+        open.push({ name: e.name || '', at: out.length })
+        out.push({ text: callText(e.name || '', e.args, 160), dot: { glyph: '●', dim: true } })
+        break
+      case 'tool_end': {
+        const i = open.findIndex(o => o.name === (e.name || ''))
+        const first = (e.out || '').split('\n').find(l => l.trim()) || ''
+        const time = e.ms != null && e.ms >= 1000 ? ` (${(e.ms / 1000).toFixed(1)}s)` : ''
+        const res: Line = { text: `${oneLine(first, 160) || L('(no output)', '（无输出）')}${time}`, dim: !!e.ok, color: e.ok ? undefined : 'error', under: true }
+        if (i >= 0) {
+          const at = open[i]!.at
+          open.splice(i, 1)
+          out[at] = { ...out[at]!, dot: { glyph: '●', color: e.ok ? 'success' : 'error' } }
+          // Put the result right under its call; later calls move down by one
+          out.splice(at + 1, 0, res)
+          for (const o of open) if (o.at > at) o.at++
+        } else out.push(res)
+        break
+      }
+      case 'error':
+        out.push({ text: `${L('Error', '出错')}: ${cut(e.text, 600)}`, color: 'error', dot: { glyph: '●', color: 'error' } })
+        break
+      case 'retry':
+        out.push({ text: `↻ ${oneLine(e.text, 300)}`, color: 'warning' })
+        break
+      case 'done': {
+        const ok = e.status === 'done'
+        out.push({ text: L(`Round ${e.round} ${ok ? 'done' : statusName(e.status || '')}`, `第 ${e.round} 轮${ok ? '完成' : statusName(e.status || '')}`), dim: ok, color: ok ? undefined : 'warning', dot: dotOf(e.status || '') })
+        break
+      }
+      case 'phase':
+        out.push({ text: e.text || '', bold: true })
+        break
+      case 'agent': {
+        const st = e.ev === 'start' ? 'running' : e.ev === 'retry' ? 'retrying' : e.ev || ''
+        const what = e.ev === 'cached' ? L(' (cached)', '（缓存）') : e.ev === 'retry' ? L(' (resubmit)', '（重交）') : ''
+        out.push({ text: `${e.label}${what}${e.model ? ` · ${e.model}` : ''}${e.text ? `: ${oneLine(e.text, 200)}` : ''}`, dim: e.ev === 'start' || e.ev === 'cached', color: e.ev === 'error' ? 'error' : undefined, dot: dotOf(st) })
+        break
+      }
+      case 'sh':
+        out.push({ text: `$ ${oneLine(e.text, 160)} → ${e.code}`, dim: e.code === 0, color: e.code === 0 ? undefined : 'warning' })
+        break
+      default:
+        out.push({ text: oneLine(e.text, 300), dim: true })
+    }
+  }
+  return out
+}
+
+function lineEl(Text: ElementConstructor<TextProps>, l: Line) {
+  return (
+    <Text color={l.color} dimColor={l.dim} bold={l.bold} italic={l.italic}>
+      {l.under ? <Text dimColor>{'  ⎿  '}</Text> : ''}
+      {l.dot ? (
+        <Text color={l.dot.color} dimColor={l.dot.dim}>
+          {l.dot.glyph}{' '}
+        </Text>
+      ) : (
+        ''
+      )}
+      {l.text}
+      {l.meta ? <Text dimColor bold={false}>{l.meta}</Text> : ''}
+    </Text>
+  )
+}
+// The `⎿` lines under a transcript row
+function subLines(Text: ElementConstructor<TextProps>, lines: Line[]) {
+  return lines.map((l, i) => (
+    <Text color={l.color} dimColor={l.dim} wrap="truncate-end">
+      <Text dimColor>{i === 0 ? '  ⎿  ' : '     '}</Text>
+      {l.dot ? (
+        <Text color={l.dot.color} dimColor={l.dot.dim}>
+          {l.dot.glyph}{' '}
+        </Text>
+      ) : (
+        ''
+      )}
+      {l.text}
+    </Text>
+  ))
+}
+// A tool result as text, whatever shape the engine stored it in
+function textOf(v: unknown): string {
+  if (typeof v === 'string') return v
+  if (!v || typeof v !== 'object') return ''
+  const o = v as Record<string, unknown>
+  if (Array.isArray(o.content))
+    return o.content.map(c => (c && typeof c === 'object' && typeof (c as { text?: unknown }).text === 'string' ? (c as { text: string }).text : '')).join('\n')
+  if (typeof o.result === 'string') return o.result
+  if (typeof o.text === 'string') return o.text
+  try {
+    return JSON.stringify(v)
+  } catch {
+    return ''
+  }
+}
+// The agent id in spawn's or flow's result ("Started pi sub-agent <id> (", "已派出 pi 子代理 <id>（"): for rows drawn
+// after a restart, when the call-to-agent map of this process is gone
+const idFrom = (v: unknown) => /(?:sub-agent|子代理|workflow|工作流) ([A-Za-z0-9._-]+)\s*[（(]/.exec(textOf(v))?.[1] || ''
+// The row as stored, drawn by the engine: only for ctrl+o on the terminal. The desktop and the other surfaces
+// have no ctrl+o and report every row as expanded, so they get the compact row too (the pane has the full record)
+const fullView = (e: { surface: string; props: { isExpanded?: boolean } }) => e.surface === 'terminal' && e.props.isExpanded === true
+async function openAgent($: EngineInterface, id: string) {
+  await activate($)
+  await select($, id)
+  await openPane($, true)
 }
 
 // ---------- tool descriptions (model-facing, English) ----------
@@ -726,8 +950,8 @@ export const register: Register = on => {
     const info = JSON.parse(r.out) as { id: string; model: string }
     await update($, mineA, list => [...list.filter(x => x !== info.id), info.id])
     await update($, notifiedA, m => ({ ...m, [info.id]: 0 }))
+    await remember($, e, info.id)
     await persist($)
-    await openPane($)
     void poll($)
     return {
       result: L(
@@ -803,8 +1027,8 @@ export const register: Register = on => {
     const info = JSON.parse(r.out) as { id: string; name: string; script: string }
     await update($, mineA, list => [...list.filter(x => x !== info.id), info.id])
     await update($, notifiedA, m => ({ ...m, [info.id]: 0 }))
+    await remember($, e, info.id)
     await persist($)
-    await openPane($)
     void poll($)
     return {
       result: L(
@@ -816,6 +1040,138 @@ export const register: Register = on => {
     }
   }).catch(failed)
 
+  // ----- transcript rows: pi's calls drawn like Claude Code's own sub-agents (display only: the model reads the same) -----
+  on('ui.render', { component: 'ToolUse', props: { tool: /^mcp__pi-subagents__/ } }, async ($, e, next) => {
+    if (fullView(e)) return next(e) // ctrl+o: the call as made
+    const { Box, Text, Button } = $.ui.resolve(e)
+    const verb = e.props.tool.slice(`mcp__${P}__`.length)
+    const input = (e.props.input && typeof e.props.input === 'object' ? e.props.input : {}) as Record<string, unknown>
+    const arg = (k: string) => (typeof input[k] === 'string' ? (input[k] as string) : '')
+    const agents = await read($, agentsA)
+    const rowOf = (id: string) => (id ? agents.find(r => r.id === id) || cache.get(id)?.row : undefined)
+    const callDot: Dot = e.props.isErrored ? { glyph: '●', color: 'error' } : e.props.isRunning ? { glyph: '●', dim: true } : { glyph: '●', color: 'success' }
+    const head = (dot: Dot, label: string, args: string, meta: string, open?: string) => (
+      <Box>
+        <Text wrap="truncate-end">
+          <Text color={dot.color} dimColor={dot.dim}>
+            {dot.glyph}{' '}
+          </Text>
+          <Text bold>{label}</Text>
+          {args ? `(${args})` : ''}
+          {meta ? <Text dimColor> {meta}</Text> : ''}
+        </Text>
+        {open && (
+          <Button key="open" plain dimColor label={L('  view', '  查看')} onPress={() => void openAgent($, open)} />
+        )}
+      </Box>
+    )
+
+    if (verb !== 'spawn' && verb !== 'flow') {
+      // The other pi tools: one compact line; their result row stays the engine's
+      const known = rowOf(arg('id'))
+      const target = known ? nameOf(known) : arg('id')
+      const args =
+        verb === 'send'
+          ? `${target}: ${oneLine(arg('message'), 60)}`
+          : verb === 'status'
+            ? input.models
+              ? L('models', '模型')
+              : target || (input.all ? L('all', '全部') : '')
+            : target
+      return head(callDot, `pi ${verb}`, args, '')
+    }
+
+    const id = (await read($, callsA))[e.props.tool_use_id] || idFrom(e.props.output)
+    const row = rowOf(id)
+    const label = verb === 'flow' ? L('pi workflow', 'pi 工作流') : 'pi'
+    const fallbackName = verb === 'flow' ? arg('resume') || L('script', '脚本') : arg('name') || oneLine(arg('task'), 48)
+    if (e.props.isErrored || !row) {
+      const lines: Line[] = e.props.isErrored
+        ? [{ text: oneLine(textOf(e.props.output), 300) || L('Failed to start', '没有启动'), color: 'error' }]
+        : [{ text: e.props.isRunning ? L('Starting…', '启动中…') : L('Running in the background', '在后台运行'), dim: true }]
+      return (
+        <Box flexDirection="column">
+          {head(e.props.isErrored ? { glyph: '●', color: 'error' } : { glyph: '●', dim: true }, label, fallbackName, arg('model'))}
+          {subLines(Text, lines)}
+        </Box>
+      )
+    }
+    const done = TERMINAL.has(row.status)
+    const lines = done ? [endLine(row)] : workLines(row, (await read($, activityA))[row.id])
+    return (
+      <Box flexDirection="column">
+        {head(dotOf(row.status), label, nameOf(row), shortModel(row), row.id)}
+        {subLines(Text, lines)}
+      </Box>
+    )
+  })
+  // Their result rows: the row above already says it all (ctrl+o shows the text the model read)
+  on('ui.render', { component: 'ToolResult', props: { tool: /^mcp__pi-subagents__(spawn|flow)$/ } }, async ($, e, next) => {
+    if (fullView(e)) return next(e)
+    const { Box } = $.ui.resolve(e)
+    return <Box />
+  })
+  // The completion notice: one line per agent instead of the whole answers (ctrl+o shows them)
+  on('ui.render', { component: 'UserMessage', props: { origin: { kind: 'plugin', name: P } } }, async ($, e, next) => {
+    if (fullView(e)) return next(e)
+    const found = [...e.props.text.matchAll(/<pi-result id="([^"]+)"[^>]*?status="([^"]+)"/g)].map(m => ({ id: m[1]!, status: m[2]! }))
+    for (const m of e.props.text.matchAll(/^- ([A-Za-z0-9._-]+) [(（]/gm)) found.push({ id: m[1]!, status: '' })
+    if (found.length === 0) return next(e)
+    const { Box, Text, Button } = $.ui.resolve(e)
+    const agents = await read($, agentsA)
+    const shown = found.slice(0, 8)
+    return (
+      <Box flexDirection="column">
+        {shown.map(f => {
+          const row = agents.find(r => r.id === f.id) || cache.get(f.id)?.row
+          const status = f.status || row?.status || 'done'
+          const end = row ? endLine({ ...row, status }) : { text: statusName(status), dim: true }
+          return (
+            <Box key={`n-${f.id}`}>
+              <Text wrap="truncate-end">
+                <Text color={dotOf(status).color} dimColor={dotOf(status).dim}>
+                  ●{' '}
+                </Text>
+                <Text bold>{row?.kind === 'flow' ? L('pi workflow', 'pi 工作流') : 'pi'}</Text>({row ? nameOf(row) : f.id}){' '}
+                <Text color={end.color} dimColor={end.dim}>
+                  {end.text}
+                </Text>
+              </Text>
+              <Button key={`v-${f.id}`} plain dimColor label={L('  view', '  查看')} onPress={() => void openAgent($, f.id)} />
+            </Box>
+          )
+        })}
+        {found.length > shown.length && <Text dimColor>{L(`  … ${found.length - shown.length} more`, `  …还有 ${found.length - shown.length} 个`)}</Text>}
+        <Text dimColor>{L('  ⎿  Results sent to Claude', '  ⎿  结果已交给 Claude')}</Text>
+      </Box>
+    )
+  })
+  // Above the prompt while this session's agents run, as Claude Code shows its background tasks
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    const below = await next(e)
+    if (e.props.hasSurvey) return below
+    const mine = await read($, mineA)
+    if (mine.length === 0) return below
+    const busy = (await read($, agentsA)).filter(r => mine.includes(r.id) && !TERMINAL.has(r.status))
+    if (busy.length === 0) return below
+    const { Box, Text, Button } = $.ui.resolve(e)
+    const flows = busy.filter(r => r.kind === 'flow').length
+    const agents = busy.length - flows
+    const parts = [
+      agents ? L(`${agents} pi ${agents === 1 ? 'agent' : 'agents'} running`, `${agents} 个 pi 子代理在跑`) : '',
+      flows ? L(`${flows} ${flows === 1 ? 'workflow' : 'workflows'}`, `${flows} 个工作流`) : '',
+    ].filter(Boolean)
+    return (
+      <Box flexDirection="column">
+        {below}
+        <Box>
+          <Text dimColor>● {parts.join(' · ')}</Text>
+          <Button key="pi-open" plain dimColor label={L('  /pi to view', '  /pi 查看')} onPress={() => void select($, '').then(() => openPane($, true))} />
+        </Box>
+      </Box>
+    )
+  })
+
   // ----- pane -----
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const els = $.ui.resolve(e)
@@ -826,36 +1182,47 @@ export const register: Register = on => {
     const selected = await read($, selectedA)
     const agents = await read($, agentsA)
     const showAll = await read($, showAllA)
+    const activity = await read($, activityA)
 
     if (!selected) {
+      const busy = agents.filter(r => !TERMINAL.has(r.status))
+      const list = [...busy, ...agents.filter(r => TERMINAL.has(r.status))]
+      const counts = [busy.length ? L(`${busy.length} running`, `${busy.length} 个在跑`) : '', agents.length - busy.length ? L(`${agents.length - busy.length} finished`, `${agents.length - busy.length} 个已结束`) : '']
+        .filter(Boolean)
+        .join(' · ')
       return (
         <Box flexDirection="column">
           <Box>
-            <Text bold>{showAll ? L('All pi sub-agents', '全部 pi 子代理') : L('pi sub-agents in this session', '本会话的 pi 子代理')} </Text>
+            <Text bold>{showAll ? L('All pi sub-agents', '全部 pi 子代理') : L('pi sub-agents in this session', '本会话的 pi 子代理')}</Text>
+            {counts ? <Text dimColor>{`  ${counts}`}</Text> : ''}
             <Button
               key="scope"
+              plain
               dimColor
-              label={showAll ? L('This session only', '只看本会话') : L('Show all', '显示全部')}
+              label={showAll ? L('  · this session', '  · 只看本会话') : L('  · show all', '  · 显示全部')}
               onPress={() => void update($, showAllA, v => !v).then(() => poll($))}
             />
           </Box>
           {agents.length === 0 && (
-            <Text dimColor>
-              {L(
-                'No pi sub-agents yet. They appear here once Claude hands out work; click one to watch it live and talk to it.',
-                '还没有 pi 子代理。Claude 派活后会出现在这里，点一行可看实时过程并直接跟它对话。',
-              )}
-            </Text>
+            <Text dimColor>{L('No pi sub-agents yet. Agents Claude starts show up here.', '还没有 pi 子代理。Claude 派出的代理会显示在这里。')}</Text>
           )}
-          {agents.map(r => (
-            <Button key={`a-${r.id}`} onPress={() => void select($, r.id)}>
-              {ICON[r.status] || '?'} {r.kind === 'flow' ? `⚙ ${r.name}` : r.name || r.alias}{' '}
-              <Text dimColor>
-                {statusName(r.status)} · {r.kind === 'flow' ? r.progress || L('workflow', '工作流') : modelOf(r)} · {ago(r.createdAt)} ·{' '}
-                {cut(r.task.replace(/\s+/g, ' '), 40)}
-              </Text>
-            </Button>
-          ))}
+          {list.map(r => {
+            const dot = dotOf(r.status)
+            const meta = TERMINAL.has(r.status)
+              ? [r.kind === 'flow' ? L('workflow', '工作流') : shortModel(r), endLine(r).text, ago(r.finishedAt || r.updatedAt || r.createdAt)]
+              : r.kind === 'flow'
+                ? [L('workflow', '工作流'), workLines(r, undefined)[0]?.text || '']
+                : [shortModel(r), nowDoing(r, activity[r.id])]
+            return (
+              <Button key={`a-${r.id}`} onPress={() => void select($, r.id)}>
+                <Text color={dot.color} dimColor={dot.dim}>
+                  {dot.glyph}
+                </Text>{' '}
+                {nameOf(r)}
+                <Text dimColor>{`  ${meta.filter(Boolean).join(' · ')}`}</Text>
+              </Button>
+            )
+          })}
         </Box>
       )
     }
@@ -866,32 +1233,58 @@ export const register: Register = on => {
     const detail = await read($, detailA)
     const notice = await read($, noticeA)
     const sendCount = await read($, sendCountA)
+    const expanded = await read($, expandA)
     const running = row ? !TERMINAL.has(row.status) : false
-    const lines = (detail && detail.id === selected ? detail.entries : []).map(linesOf)
-    const live = detail && detail.id === selected ? detail.live : null
-    const liveText = live
-      ? live.tool
-        ? L(`calling ${live.tool}…`, `正在调用 ${live.tool}…`)
+    const mine = detail && detail.id === selected
+    const live = mine ? detail.live : null
+    const liveLine: Line | null = !running || !live
+      ? null
+      : live.tool
+        ? { text: `${cap(live.tool)}(…)`, dim: true, dot: { glyph: '●', dim: true } }
         : live.text
-          ? cut(live.text.slice(-400), 400)
+          ? { text: oneLine(live.text.slice(-400), 400), dim: true, dot: { glyph: '●', dim: true } }
           : live.thinking
-            ? `${L('(thinking) ', '（思考中）')}${cut(live.thinking.slice(-200), 200)}`
-            : ''
+            ? { text: `∴ ${L('Thinking…', '思考中…')}`, dim: true, italic: true }
+            : null
+    const meta = row
+      ? [isFlow ? phaseText(row) : shortModel(row), !isFlow && row.rounds > 1 ? L(`round ${row.rounds}`, `第 ${row.rounds} 轮`) : '', TERMINAL.has(row.status) ? endLine(row).text : statusName(row.status)]
+          .filter(Boolean)
+          .join(' · ')
       : ''
-    // Workflow: the agent list takes at most about half the pane; running and failed ones come first when space is short
-    const kids = isFlow && detail && detail.id === selected ? detail.children : []
-    const kidRoom = Math.min(kids.length, Math.max(3, Math.floor(budget * 0.45)))
-    const rank = (c: FlowChild) => (c.status === 'running' ? 0 : c.status === 'error' ? 1 : 2)
-    const kidsShown = [...kids]
-      .sort((a, b) => rank(a) - rank(b) || b.index - a.index)
-      .slice(0, kidRoom)
-      .sort((a, b) => a.index - b.index)
-    // Draw only the last entries that fit
-    let room = budget - 3 - (liveText ? rowsOf(liveText, cols) : 0) - (notice ? 1 : 0) - (kids.length ? kidRoom + 1 : 0)
+
+    // Workflow: its agents grouped by phase, the phases in progress open and the others folded into one line
+    const kids = isFlow && mine ? detail.children : []
+    const phaseLines: { line: Line; kid?: FlowChild }[] = []
+    if (isFlow && row) {
+      const order = [...row.phases]
+      for (const k of kids) if (!order.includes(k.phase || '')) order.push(k.phase || '')
+      for (const title of order) {
+        const group = kids.filter(k => (k.phase || '') === title)
+        const c = flowCounts(group)
+        const current = title === row.phase
+        const status = c.running ? 'running' : group.length === 0 ? 'todo' : c.failed ? 'error' : c.done === group.length ? 'done' : 'running'
+        const sum = group.length
+          ? [L(`${c.done}/${group.length} done`, `完成 ${c.done}/${group.length}`), c.failed ? L(`${c.failed} failed`, `${c.failed} 个失败`) : '', c.running ? L(`${c.running} running`, `${c.running} 个在跑`) : ''].filter(Boolean).join(' · ')
+          : L('not started', '未开始')
+        phaseLines.push({ line: { text: title || L('(no phase)', '（无阶段）'), meta: `  ${sum}`, bold: true, dot: dotOf(status), dim: status === 'todo' } })
+        // Open: the phase in progress, phases with running or failed agents, and every phase once the workflow ended
+        if (!(current || c.running || c.failed || !running || order.length === 1)) continue
+        const rank = (k: FlowChild) => (k.status === 'running' ? 0 : k.status === 'error' ? 1 : 2)
+        for (const k of [...group].sort((a, b) => rank(a) - rank(b) || a.index - b.index))
+          phaseLines.push({ kid: k, line: { text: `${k.label}${k.model ? `  ${k.model}` : ''}${k.note ? ` · ${oneLine(k.note, 60)}` : ''}`, dot: dotOf(k.status), dim: k.status === 'done' || k.status === 'cached' } })
+      }
+    }
+    const kidRoom = expanded ? phaseLines.length : Math.min(phaseLines.length, Math.max(4, Math.floor(budget * 0.6)))
+    const phaseShown = phaseLines.slice(0, kidRoom)
+
+    // Draw only the last record lines that fit, or all of them once expanded (the pane then scrolls)
+    // A workflow's agents and phases are in the table above: its log keeps the rest (commands, log lines, errors)
+    const lines = mine ? transcript(isFlow ? detail.entries.filter(x => x.k !== 'agent' && x.k !== 'phase') : detail.entries) : []
+    let room = budget - 2 - (liveLine ? rowsOf(liveLine.text, cols) : 0) - (notice ? 1 : 0) - (phaseShown.length ? phaseShown.length + 1 : 0) - (Input && !isFlow ? 2 : 0)
     const shown: Line[] = []
-    for (let i = lines.length - 1; i >= 0 && room > 0; i--) {
+    for (let i = lines.length - 1; i >= 0 && (expanded || room > 0); i--) {
       const line = lines[i]!
-      room -= rowsOf(line.text, cols)
+      room -= rowsOf(line.text, cols - 5)
       shown.unshift(line)
     }
     const hidden = lines.length - shown.length
@@ -899,61 +1292,76 @@ export const register: Register = on => {
     return (
       <Box flexDirection="column">
         <Box>
-          <Button key="back" dimColor label={parent ? L('← Workflow', '← 工作流') : L('← List', '← 列表')} onPress={() => void select($, parent)} />
-          <Text bold> {row ? `${ICON[row.status] || ''} ${isFlow ? '⚙ ' : ''}${row.name || row.id}` : selected} </Text>
-          <Text dimColor>
-            {row
-              ? `${statusName(row.status)} · ${isFlow ? row.progress || L('workflow', '工作流') : `${modelOf(row)} · ${L(`round ${row.rounds}`, `第 ${row.rounds} 轮`)}`}`
-              : ''}{' '}
+          <Button key="back" plain dimColor label={parent ? L('← workflow  ', '← 工作流  ') : L('← all  ', '← 全部  ')} onPress={() => void select($, parent)} />
+          <Text wrap="truncate-end">
+            {row ? (
+              <Text color={dotOf(row.status).color} dimColor={dotOf(row.status).dim}>
+                {dotOf(row.status).glyph}{' '}
+              </Text>
+            ) : (
+              ''
+            )}
+            <Text bold>{row ? nameOf(row) : selected}</Text>
+            <Text dimColor>{meta ? `  ${meta}` : ''}</Text>
           </Text>
           {running && (
             <Button
               key="stop"
-              label={L('Stop', '停止')}
-              onPress={() =>
-                void pisub($, ['stop', selected]).then(r => update($, noticeA, () => r.out || r.err)).then(() => poll($))
-              }
+              plain
+              dimColor
+              label={L('  stop', '  停止')}
+              onPress={() => void pisub($, ['stop', selected]).then(r => update($, noticeA, () => r.out || r.err)).then(() => poll($))}
             />
           )}
         </Box>
+        {phaseShown.map(p =>
+          p.kid ? (
+            <Button key={`c-${p.kid.index}`} plain onPress={() => (p.kid!.id ? void select($, p.kid!.id) : undefined)}>
+              {'   '}
+              <Text color={p.line.dot?.color} dimColor={p.line.dot?.dim}>
+                {p.line.dot?.glyph}
+              </Text>{' '}
+              <Text dimColor={p.line.dim}>{p.line.text}</Text>
+            </Button>
+          ) : (
+            lineEl(Text, p.line)
+          ),
+        )}
+        {phaseLines.length > phaseShown.length && (
+          <Button
+            key="more-agents"
+            plain
+            dimColor
+            label={L(`   ↓ ${phaseLines.length - phaseShown.length} more lines, show them`, `   ↓ 还有 ${phaseLines.length - phaseShown.length} 行，点开查看`)}
+            onPress={() => void update($, expandA, () => true)}
+          />
+        )}
+        {phaseShown.length > 0 && shown.length > 0 && <Text dimColor>{L('Log', '日志')}</Text>}
         {hidden > 0 && (
-          <Text dimColor>
-            {L(`(${hidden} earlier entries; full transcript: pisub log ${selected} --full)`, `（前面还有 ${hidden} 条，完整过程：pisub log ${selected} --full）`)}
-          </Text>
+          <Button
+            key="more"
+            plain
+            dimColor
+            label={L(`↑ ${hidden} earlier ${hidden === 1 ? 'line' : 'lines'}, show them`, `↑ 前面还有 ${hidden} 行，点开查看`)}
+            onPress={() => void update($, expandA, () => true)}
+          />
         )}
-        {shown.map(l => (
-          <Text color={l.color} dimColor={l.dim} bold={l.bold}>
-            {l.text}
-          </Text>
-        ))}
-        {liveText && <Text dimColor>… {liveText}</Text>}
-        {kids.length > 0 && (
-          <Text bold>
-            {L(
-              `Agents (${kids.length}${kidsShown.length < kids.length ? `, showing ${kidsShown.length}` : ''}; click one to see its work and talk to it)`,
-              `子代理（共 ${kids.length} 个${kidsShown.length < kids.length ? `，显示 ${kidsShown.length} 个` : ''}，点一行看过程、跟它对话）`,
+        {expanded && (
+          <Box>
+            <Button key="less" plain dimColor label={L('↓ collapse', '↓ 收起')} onPress={() => void update($, expandA, () => false)} />
+            {mine && detail.entries.length >= 300 && (
+              <Text dimColor>{L(`  (the latest 300 entries; all of them: pisub log ${selected} --full)`, `  （只显示最近 300 条；全部：pisub log ${selected} --full）`)}</Text>
             )}
-          </Text>
+          </Box>
         )}
-        {kidsShown.map(k => (
-          <Button key={`c-${k.index}`} onPress={() => (k.id ? void select($, k.id) : undefined)}>
-            {CHILD_ICON[k.status] || '·'} {k.label}{' '}
-            <Text dimColor>
-              {k.model}
-              {k.phase ? ` · ${k.phase}` : ''}
-              {k.note ? ` · ${cut(k.note, 60)}` : ''}
-            </Text>
-          </Button>
-        ))}
+        {shown.map(l => lineEl(Text, l))}
+        {liveLine && lineEl(Text, liveLine)}
+        {expanded && <Button key="less-end" plain dimColor label={L('↑ collapse', '↑ 收起')} onPress={() => void update($, expandA, () => false)} />}
         {notice && <Text color="suggestion">{notice}</Text>}
         {Input && !isFlow && (
           <Input
             key={`msg-${sendCount}`}
-            placeholder={
-              running
-                ? L('Steer it (Enter to send)', '给它插话（Enter 发送）')
-                : L('It has finished: send a message to resume its previous session', '它已结束：发消息让它接着原会话续做')
-            }
+            placeholder={running ? L('Message it (Enter to send)', '给它发消息（Enter 发送）') : L('Continue where it left off…', '接着跟它说…')}
             submitLabel={L('Send', '发送')}
             onSubmit={value => {
               const text = value.trim()

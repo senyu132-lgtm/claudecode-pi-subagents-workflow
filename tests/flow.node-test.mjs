@@ -105,7 +105,7 @@ test('a failed agent returns null and is counted', async () => {
     hooks: { runAgent: async p => (p === 'bad' ? null : 'fine') },
   });
   assert.deepEqual(value, ['fine']);
-  assert.deepEqual(stats, { calls: 2, done: 1, failed: 1, cached: 0, failures: [{ index: 2, label: 'bad' }], unawaited: 0 });
+  assert.deepEqual(stats, { calls: 2, done: 1, failed: 1, cached: 0, shCached: 0, failures: [{ index: 2, label: 'bad' }], unawaited: 0 });
 });
 
 test('concurrency limits are per model: at most 2 "cheap" at once, the default model counted separately', async () => {
@@ -314,6 +314,7 @@ test('sh(cmd, { cache: true }) is not run again on resume once it succeeded (P2-
   const r3 = await runFlow({ src, hooks: { runAgent: async () => '', runSh, log: t => logs.push(t), ...j } });
   assert.deepEqual(r3.value, ['out 3', 'out 5']);
   assert.equal(runs, 5);
+  assert.equal(r3.stats.shCached, 1);
   assert.ok(logs.some(t => /from cache/.test(t)));
 });
 
@@ -401,4 +402,25 @@ test('messages follow the language setting', () => {
   } finally {
     setLanguage('en');
   }
+});
+
+test('a host that throws while starting an agent counts as a failed attempt: retries and required still apply', async () => {
+  setLanguage('en');
+  let calls = 0;
+  const errors = [];
+  const runAgent = async () => {
+    if (++calls < 2) throw new Error('spawn failed');
+    return 'ok';
+  };
+  const { value, stats } = await runFlow({ src: META + `return await agent('x', { retries: 1 })`, hooks: { runAgent, onError: t => errors.push(t) } });
+  assert.equal(value, 'ok');
+  assert.equal(calls, 2);
+  assert.equal(stats.failed, 0);
+  assert.ok(errors.some(t => /could not run: spawn failed/.test(t)));
+  const fatal = [];
+  await assert.rejects(
+    runFlow({ src: META + `return await agent('x', { required: true })`, hooks: { runAgent: async () => { throw new Error('boom'); }, onFatal: m => fatal.push(m) } }),
+    /required agent #1/
+  );
+  assert.equal(fatal.length, 1);
 });

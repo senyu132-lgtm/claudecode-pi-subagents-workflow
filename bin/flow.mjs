@@ -296,7 +296,7 @@ export async function runFlow({ src, args, defaultModel = '', limits = {}, stagg
   const seen = new Map();
   let counter = 0;
   let current = '';
-  const stats = { calls: 0, done: 0, failed: 0, cached: 0, failures: [], unawaited: 0 };
+  const stats = { calls: 0, done: 0, failed: 0, cached: 0, shCached: 0, failures: [], unawaited: 0 };
   // Every agent()/sh() call still running: the workflow does not finish before they settle
   const inflight = new Set();
   const track = p => {
@@ -365,7 +365,15 @@ export async function runFlow({ src, args, defaultModel = '', limits = {}, stagg
       for (let attempt = 0; attempt <= retries; attempt++) {
         checkRunning();
         if (attempt) h.log(L(`agent #${info.index} "${info.label}" failed; retry ${attempt}/${retries}`, `代理 #${info.index}「${info.label}」失败，重试 ${attempt}/${retries}`));
-        value = await h.runAgent(prompt, runOpts, { ...info, attempt });
+        try {
+          value = await h.runAgent(prompt, runOpts, { ...info, attempt });
+        } catch (e) {
+          if (e?.fatal || fatal || h.isAborted()) throw e;
+          // The host failed, not the agent's answer: count it as a failed attempt, so retries, required and
+          // failFast still apply
+          h.onError(L(`agent #${info.index} "${info.label}" could not run: ${errText(e)}`, `代理 #${info.index}「${info.label}」没能运行：${errText(e)}`));
+          value = null;
+        }
         if (value !== null && value !== undefined) break;
         if (fatal || h.isAborted()) break;
       }
@@ -442,6 +450,7 @@ export async function runFlow({ src, args, defaultModel = '', limits = {}, stagg
     const info = { index: 0, label: `sh: ${shown.slice(0, 60)}` };
     const hit = h.cached(key, n);
     if (hit) {
+      stats.shCached++;
       h.log(L(`sh (from cache, not run again): ${shown.slice(0, 200)}`, `sh（用缓存，没有重新执行）：${shown.slice(0, 200)}`));
       h.record(key, n, hit.value, { ...info, cached: true });
       return JSON.parse(JSON.stringify(hit.value));

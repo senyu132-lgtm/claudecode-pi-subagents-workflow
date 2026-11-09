@@ -78,6 +78,20 @@ describe('broker', { concurrency: 8 }, () => {
     assert.equal(r.out, 'answer: count the rows');
   });
 
+  it('tool calls are counted for the transcript row: the last ones in live.json, the total in state.json', async () => {
+    const h = home();
+    const id = await start(h, '[slow 1500] count the rows');
+    const live = await until(() => {
+      const l = JSON.parse(fs.readFileSync(path.join(runDir(h, id), 'live.json'), 'utf8'));
+      return l.tools === 1 ? l : null;
+    });
+    assert.equal(live.recent.length, 1);
+    assert.equal(live.recent[0].name, 'bash');
+    assert.match(live.recent[0].args, /sleep 1500/);
+    await until(() => state(h, id).status === 'done');
+    assert.equal(state(h, id).toolUses, 1);
+  });
+
   it('a prompt pi turns down ends the round with an error, not a run that never ends (T02)', async () => {
     const h = home();
     const t0 = Date.now();
@@ -216,9 +230,12 @@ describe('broker', { concurrency: 8 }, () => {
     await until(() => state(h, a).status === 'running');
     const b = await start(h, 'second');
     await until(() => state(h, b).status === 'queued');
+    assert.equal((await pisub(h, ['send', b, 'note for later'])).code, 0);
     await pisub(h, ['stop', b]);
     await until(() => state(h, b).status === 'stopped');
     assert.match(final(h, b), /never started/);
+    // A message it could no longer receive is named, not dropped silently
+    assert.match(final(h, b), /not delivered: .*note for later/);
     await pisub(h, ['wait', a, '--timeout', '60']);
   });
 
@@ -256,6 +273,19 @@ describe('broker', { concurrency: 8 }, () => {
     const r = await pisub(h, ['spawn', 'x']);
     assert.notEqual(r.code, 0);
     assert.match(r.err, /config\.json is not valid JSON/);
+  });
+
+  it('a config value of the wrong type is refused, naming the key', async () => {
+    for (const [config, re] of [
+      [{ overloadBackoffSec: 5 }, /overloadBackoffSec must be a list of seconds/],
+      [{ maxAgents: 'many' }, /maxAgents must be a number, 0 or more, not "many"/],
+      [{ flowConcurrency: 8 }, /flowConcurrency must be an object/],
+      [{ stallTimeoutMin: null }, /stallTimeoutMin must be a number/],
+    ]) {
+      const r = await pisub(home(config), ['spawn', 'x']);
+      assert.notEqual(r.code, 0);
+      assert.match(r.err, re);
+    }
   });
 
   it('run files are private to the user (N-14, POSIX only)', { skip: process.platform === 'win32' }, async () => {
@@ -366,6 +396,21 @@ describe('worktrees', { concurrency: 2 }, () => {
     assert.match(cl.out, /Removed 1 finished run\b/);
     assert.ok(!fs.existsSync(runDir(h, id)));
     assert.equal(git(dir, 'branch', '--list', `pi/${id}`), '');
+  });
+
+  it('when git cannot stage the agent\'s files the worktree is kept, not removed as unchanged', async () => {
+    const h = home();
+    const dir = repo(h);
+    const r = await pisub(h, ['spawn', '--worktree', '--cwd', dir, '--json', '[slow 2500] [write b.txt keep-me] add a file']);
+    const id = JSON.parse(r.out).id;
+    await until(() => state(h, id).status === 'running' && fs.existsSync(state(h, id).worktree.dir));
+    const wt = state(h, id).worktree.dir;
+    const lock = path.join(path.resolve(wt, git(wt, 'rev-parse', '--git-dir')), 'index.lock');
+    fs.writeFileSync(lock, '');
+    const w = await pisub(h, ['wait', id, '--timeout', '60']);
+    assert.match(w.out, /git add failed/);
+    assert.equal(fs.readFileSync(path.join(wt, 'b.txt'), 'utf8'), 'keep-me');
+    fs.rmSync(lock);
   });
 
   it('pisub apply refuses as a whole when your files moved on, and changes nothing', async () => {

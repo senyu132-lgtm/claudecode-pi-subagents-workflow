@@ -31,7 +31,8 @@ So this plugin splits the work. Claude keeps the parts that need its judgment: p
 
 - **Claude only gets the result.** Claude starts an agent with `spawn` and keeps working. When the agent finishes, Claude gets one message with its final answer. Everything in between (tool calls, file reads, reasoning) stays on disk, so Claude's context doesn't fill up with it and the main conversation lasts longer.
 - **Workflows.** After you type `/pi flow`, Claude can write a short script that runs many agents. The script format follows Claude Code's own Workflow scripts (`agent`, `pipeline`, `parallel`, `phase`), and adds a few things: answers can be checked against a JSON Schema (the agent is asked to redo it if they don't match), `sh()` runs your own check scripts, each model gets its own concurrency limit, and a re-run reuses the results of steps that didn't change.
-- **You can watch and talk to them.** `/pi` opens a panel with all the agents. Click one to see what it's doing right now. Type into it to give it extra instructions, or to make a finished agent continue.
+- **They look like native sub-agents.** In the conversation, an agent shows up the way Claude Code's own sub-agents do: `● pi(task) strong`, its latest tool calls under it while it runs, then one line such as `Done (8 tool uses · 1m 12s)`. A workflow shows its phase and the agents running in it. The result message is one line per agent (ctrl+o shows the full text). This only changes what you see: Claude reads exactly the same text, so it costs no extra Claude quota.
+- **You can watch and talk to them.** `/pi` (or **view** on an agent's row) opens a panel with all the agents. Click one to follow its work, drawn like the main conversation. Type into it to give it extra instructions, or to make a finished agent continue.
 - **Any model, mixed in one job.** Give your models short names in a config file, for example `brain` for a strong one and `worker` for a cheap one, and use both in the same workflow.
 - **Edits can stay off your files.** With `isolation: 'worktree'` (`--worktree` on the CLI) an agent works in its own git worktree, on a branch of its own. You look at the diff and bring it in with `pisub apply <id>` when you're happy with it, and agents working in parallel can't overwrite each other.
 - **It keeps going.** Every agent runs in its own background process, so it isn't killed when Claude Code restarts. If a provider says you've hit your usage limit, the agent can switch to another account and continue where it stopped. Rate limits and overloads are retried with increasing waits.
@@ -92,7 +93,7 @@ Start a new Claude Code session and ask something like:
 
 > Use a pi sub-agent to find all the TODO comments in this repo and group them by file.
 
-Claude starts an agent and tells you it's running. Type `/pi` to watch it. When it's done, Claude receives the answer and carries on.
+Claude starts an agent, and it shows up in the conversation like a native sub-agent, with its latest tool calls. Click **view** on that row, or type `/pi`, to watch it in detail. When it's done, Claude receives the answer and carries on.
 
 Without a config file, pi uses its own default model (the one you last picked in pi). To give Claude several models to choose from, set up a config file as described below.
 
@@ -102,9 +103,10 @@ Without a config file, pi uses its own default model (the one you last picked in
 
 **The `/pi` panel**
 - By default it lists the agents started in this session. **Show all** also shows agents from other sessions and from the command line.
-- Click an agent to see its live output: messages, tool calls, errors, and what it's typing right now.
+- Click an agent to see its live output in the style of the main conversation: `> prompt`, `● Bash(…)` with `⎿ output` under it, errors in red, and what it's typing right now.
+- While agents of this session are running, a line above the prompt says how many; click it to open the panel.
 - Type in the box at the bottom. While the agent is running, your message is passed to it after its current step. If it has finished, it continues the same conversation, and Claude gets the new result when it's done.
-- **Stop** stops it. For a workflow, the panel shows the current phase and every agent inside it; click one to open it.
+- **stop** stops it. For a workflow, the panel lists the agents by phase (the phase in progress open, finished ones folded into one line) and its log below; click an agent to open it.
 
 **Workflows are off until you turn them on.** Type `/pi flow` in a session to allow them there, and `/pi flow off` to turn them off. This is on purpose: a workflow can start dozens of agents, so it only happens when you've said yes. The setting is remembered if you resume the session later.
 
@@ -165,7 +167,7 @@ Every setting:
 | `toolTimeoutMin` | A single tool call that runs longer than this is treated as hung. `0` turns this off. | `120` |
 | `keepRunsDays` | Finished runs older than this are deleted, checked once a day. Branches that hold changes are kept. `0` keeps everything. | `30` |
 
-A `config.json` that isn't valid JSON is reported as an error rather than quietly replaced by the defaults.
+A broken `config.json` is reported as an error that names the bad setting, rather than quietly replaced by the defaults. Broken means invalid JSON, or a setting of the wrong type, such as text where a number belongs.
 
 **Several accounts for one model (`providers`).** If you have more than one account with a provider, set each up in pi as its own provider (pi's docs on `models.json` and custom providers explain how), then list them under `providers`. When one account hits its usage limit, the agent switches to the next one and carries on. An exhausted account is skipped by every agent until it resets; `pisub accounts` shows which are resting and `pisub accounts reset` clears that.
 
@@ -283,6 +285,7 @@ The plugin has no server of its own. Your code and prompts go only to the model 
 - Notifications need an interactive Claude Code session (terminal or desktop app).
 - A retry, or an agent continuing after its account switched, may repeat something it had already half done (a file written, a command run). It is told to check what's already done first, but that's up to the model.
 - A worktree only isolates files in the repository. An isolated agent can still run commands that reach anything on your machine.
+- Files matched by `.gitignore` (build output, for example) are not committed to the agent's branch; they go when its worktree is removed.
 - I've mainly used it on Windows 11. macOS and Linux are handled in the code but haven't been tested as much. Issues and pull requests are welcome.
 
 ## Uninstall
