@@ -1,0 +1,21 @@
+{
+  "name": "pi-subagents",
+  "version": "1.0.0",
+  "description": "Run the pi coding agent as background sub-agents and multi-agent workflows in Claude Code, on whatever model you like, so the grunt work does not use up your Claude quota. Made with Claude Code and Claude Opus 5.5.",
+  "author": {
+    "name": "senyu132-lgtm",
+    "url": "https://github.com/senyu132-lgtm"
+  },
+  "homepage": "https://github.com/senyu132-lgtm/claudecode-pi-subagents-workflow",
+  "repository": "https://github.com/senyu132-lgtm/claudecode-pi-subagents-workflow",
+  "license": "MIT",
+  "keywords": [
+    "subagents",
+    "workflow",
+    "pi",
+    "multi-agent",
+    "orchestration",
+    "claude-pro"
+  ],
+  "types": "./types/index.d.ts"
+}

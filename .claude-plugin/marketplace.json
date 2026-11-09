@@ -1,0 +1,14 @@
+{
+  "name": "claudecode-pi-subagents-workflow",
+  "owner": {
+    "name": "senyu132-lgtm"
+  },
+  "description": "Background sub-agents and workflows for Claude Code that run on other models via pi. Handy if you are on Claude Pro.",
+  "plugins": [
+    {
+      "name": "pi-subagents",
+      "source": "./",
+      "description": "Hand work to pi agents running any model: Claude only gets the final answers, you can watch and talk to them in a panel, and workflows can run many at once."
+    }
+  ]
+}
