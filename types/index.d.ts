@@ -22,6 +22,8 @@ export type AgentRow = {
   failed: number
   // Tool calls over the agent's life (as of its last finished round), and when it last finished
   toolUses: number
+  // Tokens used (an agent: its session so far; a workflow: all its agents), 0 when unknown
+  tokens: number
   finishedAt: number
   // Workflows: the phase titles from meta, the current phase, and its agents
   phases: string[]
@@ -72,6 +74,8 @@ declare module 'claude-code' {
       sendCount: number
       // How the pane's input box sends: true = interrupt
       interrupt: boolean
+      // Strict notices (noticeFallback: false): why results could not be delivered, '' when nothing is stuck
+      stuck: string
       expanded: boolean
       flowOn: boolean
       activity: Shaped<Record<string, Activity>>

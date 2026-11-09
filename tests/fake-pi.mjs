@@ -7,6 +7,9 @@
 //   [handled]         the prompt is consumed without a run (disposition "handled")
 //   [slow N]          the run calls a tool that takes N ms (an abort ends it early)
 //   [overload]        the run ends with an "overloaded" error (the broker backs off and retries)
+//   [tools N]         the run makes N quick tool calls
+//   [json k=v,k2=v2]  the final answer is the JSON object {"k":"v","k2":"v2"} instead of "answer: ..."
+// Every assistant reply carries usage, like pi's: 100 input and 10 output tokens, $0.001.
 //   [write F TEXT]    the run writes TEXT into file F of its working directory
 //   [empty]           the final answer has no text
 //   [silent]          the run starts and then sends nothing
@@ -34,6 +37,10 @@ const opt = name => {
 if (process.env.FAKE_PI_ARGV) fs.appendFileSync(process.env.FAKE_PI_ARGV, JSON.stringify(argv) + '\n');
 const modes = new Set((process.env.FAKE_PI || '').split(',').filter(Boolean));
 const sessionDir = opt('--session-dir') || process.cwd();
+// provider/model as pisub passed them, for the usage on each reply
+const MODEL_ARG = opt('--model') || 'fake/fake-model';
+const MODEL = MODEL_ARG.includes('/') ? [MODEL_ARG.slice(0, MODEL_ARG.indexOf('/')), MODEL_ARG.slice(MODEL_ARG.indexOf('/') + 1)] : ['', MODEL_ARG];
+const USAGE = { input: 100, output: 10, cacheRead: 0, cacheWrite: 0, totalTokens: 110, cost: { total: 0.001 } };
 fs.mkdirSync(sessionDir, { recursive: true });
 const sessionFile = opt('--session') || path.join(sessionDir, 'fake-session.jsonl');
 fs.appendFileSync(sessionFile, '');
@@ -95,6 +102,11 @@ async function run(message) {
     while (Date.now() - t0 < Number(slow[1]) && !aborted) await sleep(50);
     send({ type: 'tool_execution_end', toolName: 'bash', isError: false, durationMs: Date.now() - t0, result: { content: [{ type: 'text', text: 'slept' }] } });
   }
+  const tools = /\[tools (\d+)\]/.exec(message);
+  for (let i = 0; tools && i < Number(tools[1]); i++) {
+    send({ type: 'tool_execution_start', toolName: 'read', args: { path: `f${i}.txt` } });
+    send({ type: 'tool_execution_end', toolName: 'read', isError: false, durationMs: 1, result: { content: [{ type: 'text', text: 'ok' }] } });
+  }
   const write = /\[write (\S+) ([^\]]*)\]/.exec(message);
   if (write) fs.writeFileSync(path.join(process.cwd(), write[1]), write[2]);
   if (aborted) {
@@ -102,8 +114,13 @@ async function run(message) {
     return settled({ type: 'agent_settled', aborted: true });
   }
   const clean = message.replace(/\[[^\]]*\]\s*/g, '').trim();
-  lastText = message.includes('[empty]') ? '' : `answer: ${clean}${steers.length ? ` | steers: ${steers.join(',')}` : ''}`;
-  send({ type: 'message_end', message: { role: 'assistant', content: lastText ? [{ type: 'text', text: lastText }] : [], stopReason: 'stop' } });
+  const json = /\[json ([^\]]*)\]/.exec(message);
+  lastText = message.includes('[empty]')
+    ? ''
+    : json
+      ? JSON.stringify(Object.fromEntries(json[1].split(',').map(kv => kv.split('='))))
+      : `answer: ${clean}${steers.length ? ` | steers: ${steers.join(',')}` : ''}`;
+  send({ type: 'message_end', message: { role: 'assistant', provider: MODEL[0], model: MODEL[1], content: lastText ? [{ type: 'text', text: lastText }] : [], stopReason: 'stop', usage: USAGE } });
   settled({ type: 'agent_settled' });
 }
 

@@ -107,6 +107,90 @@ export function checkSchema(schema) {
   return walk(schema, '$');
 }
 
+// A value that matches the schema, for a workflow's dry run: the smallest plausible one (enum/const first,
+// required fields plus the other listed ones, one item per array). Best effort: patterns, `not` and the like are
+// not solved for, so the caller checks the result with validate().
+export function sample(schema) {
+  function gen(s, depth) {
+    if (depth > 30 || s === false) return null;
+    if (s === true || !isObject(s)) return 'sample';
+    if (own(s, '$ref')) {
+      const t = resolve(schema, s.$ref);
+      if (t !== undefined) return gen(t, depth + 1);
+    }
+    if (own(s, 'const')) return s.const;
+    if (Array.isArray(s.enum) && s.enum.length) return s.enum[0];
+    for (const v of [...(Array.isArray(s.examples) ? s.examples : []), ...(own(s, 'default') ? [s.default] : [])])
+      if (validate(s, v) === null) return v;
+    // allOf: one value that satisfies the branches, built from their merged object parts
+    if (Array.isArray(s.allOf) && s.allOf.length) {
+      const parts = s.allOf.map(b => (isObject(b) && own(b, '$ref') ? resolve(schema, b.$ref) : b)).filter(isObject);
+      const merged = { ...s, allOf: undefined, properties: { ...(s.properties || {}) }, required: [...(s.required || [])] };
+      for (const b of parts) {
+        Object.assign(merged.properties, b.properties || {});
+        merged.required.push(...(b.required || []));
+        if (b.type && !merged.type) merged.type = b.type;
+      }
+      delete merged.allOf;
+      return gen(merged, depth + 1);
+    }
+    for (const k of ['anyOf', 'oneOf']) {
+      if (!Array.isArray(s[k]) || !s[k].length) continue;
+      const rest = { ...s };
+      delete rest[k];
+      for (const b of s[k]) {
+        const v = gen(isObject(b) ? { ...rest, ...b } : b, depth + 1);
+        if (validate(s, v) === null) return v;
+      }
+      return gen(s[k][0], depth + 1);
+    }
+    const types = Array.isArray(s.type) ? s.type : s.type ? [s.type] : [];
+    const type =
+      types.find(t => t !== 'null') ||
+      types[0] ||
+      (s.properties || s.required ? 'object' : s.items || s.prefixItems ? 'array' : s.minimum !== undefined || s.maximum !== undefined ? 'number' : 'string');
+    if (type === 'null') return null;
+    if (type === 'boolean') return false;
+    if (type === 'number' || type === 'integer') {
+      let v = s.minimum ?? (s.exclusiveMinimum !== undefined ? s.exclusiveMinimum + 1 : 0);
+      if (s.maximum !== undefined && v > s.maximum) v = s.maximum;
+      if (s.exclusiveMaximum !== undefined && v >= s.exclusiveMaximum) v = s.exclusiveMaximum - 1;
+      if (s.multipleOf) v = Math.ceil(v / s.multipleOf) * s.multipleOf;
+      return type === 'integer' ? Math.ceil(v) : v;
+    }
+    if (type === 'string') {
+      let v = 'sample';
+      if (s.minLength !== undefined && v.length < s.minLength) v = v.padEnd(s.minLength, 'x');
+      if (s.maxLength !== undefined) v = v.slice(0, s.maxLength);
+      return v;
+    }
+    if (type === 'array') {
+      const tuple = Array.isArray(s.prefixItems) ? s.prefixItems : Array.isArray(s.items) ? s.items : [];
+      const each = Array.isArray(s.items) ? s.additionalItems : s.items;
+      const n = Math.max(tuple.length, s.minItems ?? 0, each === undefined && !tuple.length ? 0 : 1);
+      const max = s.maxItems ?? Infinity;
+      const out = [];
+      for (let i = 0; i < Math.min(n, max); i++) {
+        const v = gen(i < tuple.length ? tuple[i] : each ?? true, depth + 1);
+        // uniqueItems: tell repeated samples apart
+        out.push(s.uniqueItems && typeof v === 'string' && i ? `${v}${i + 1}` : s.uniqueItems && typeof v === 'number' && i ? v + i : v);
+      }
+      return out;
+    }
+    // object
+    const props = s.properties || {};
+    const required = Array.isArray(s.required) ? s.required : [];
+    const max = s.maxProperties ?? Infinity;
+    const out = {};
+    for (const k of [...required, ...Object.keys(props).filter(k => !required.includes(k))]) {
+      if (Object.keys(out).length >= max && !required.includes(k)) break;
+      out[k] = gen(own(props, k) ? props[k] : s.additionalProperties ?? true, depth + 1);
+    }
+    return out;
+  }
+  return gen(schema, 0);
+}
+
 export function validate(schema, value) {
   function visit(s, v, at, depth) {
     if (depth > 200) throw new Error(L(`${at} exceeds schema recursion limit`, `${at} 超过模式递归限制`));

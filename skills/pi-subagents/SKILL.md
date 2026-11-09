@@ -34,7 +34,7 @@ Use them to save the user's Claude quota: you plan, split, review and decide; pi
 - An agent is closed once it has given its final answer (`send` is refused). To carry on, `spawn` a new one and put the context it needs, and the old result, into the task.
 - That notice is a background command the plugin starts itself (it only prints the results file). You didn't start it and the user didn't say it.
 - Notifications are merged: results that land close together share one. While you are working, the engine queues it like any other background task.
-- Rarely (no Bash/PowerShell in the session, or the background command was refused) it falls back to a `[pi sub-agent notification, not a user message]` message with the same content.
+- Rarely (no Bash/PowerShell in the session, or the background command was refused) it falls back to a `[pi sub-agent notification, not a user message]` message with the same content. If the user set `noticeFallback: false`, it never falls back: the results wait, and a line above the prompt tells the user, who can retry.
 - `claude -p` (headless) exits at the end of the turn and never sees notifications. Use the CLI with `--wait` there.
 - The user can watch any agent live in the `/pi` pane and talk to it; their messages are labeled "You".
 
@@ -45,7 +45,7 @@ node "{{PISUB}}" spawn --model <alias> --cwd <dir> --task-file <instructions fil
 ```
 - `--wait`: wait until it finishes and print only the final answer to stdout. Good inside a background shell command, which notifies you when it ends.
 - Without `--wait`: prints the id right away; later use `pisub wait <id>` or `pisub result <id>`.
-- Other commands: `send`, `status`, `log`, `stop`, `models`, `accounts`, `apply <id>` (bring a worktree agent's branch into the user's files; `--check` first), `clean`, `help`.
+- Other commands: `send`, `status`, `log`, `stop`, `models`, `accounts`, `usage` (tokens and cost; `--by provider|model|alias|day|workflow`, `--days N`), `apply <id>` (bring a worktree agent's branch into the user's files; `--check` first), `clean`, `help`.
 - Agents started from the CLI also show up under "Show all" in the `/pi` pane.
 - The script gets the result, so the plugin does not notify.
 
@@ -55,7 +55,8 @@ node "{{PISUB}}" spawn --model <alias> --cwd <dir> --task-file <instructions fil
 - If it is off, do not use it and do not fall back to the CLI: `pisub flow run` refuses too. You may suggest the user turn it on.
 - Good for multi-step orchestration with loops, branches or fan-out, e.g. "N data files: cheap model analyzes each → a script checks the numbers → strong model reviews each report → disputed ones get redone".
 - Written like Claude Code's Workflow scripts: `meta`, `agent`, `pipeline`, `parallel`, `phase`, `log`, `args`, plus `sh` for checking scripts. Details are in the tool description. Plain JavaScript.
-- You are notified once, with the script's return value; agents inside are not reported one by one.
+- Before a large or expensive workflow, run it once with `dryRun: true`: no model is called and nothing starts. `agent()` returns sample data from its schema, and `sh()` runs only commands marked `readonly: true` (mark your check scripts that way). The report gives script errors with line numbers, the agents a real run would start per model and phase, and problems such as unknown aliases. Fix what it finds, then run for real.
+- You are notified once, with the script's return value; agents inside are not reported one by one. The summary on top includes the tokens used and "Worth a second look": agents that finished far faster, called no tool, wrote far less or copied another answer, compared with their phase and model. Spot-check those first.
 - Failures: a failed agent returns `null` and the final notification lists every failure with its reason. Use `retries`, `required: true` or `meta.failFast: true` when a missing result must not pass silently. Always `await` agent() and sh().
 - Agents that edit files in parallel: give them `isolation: 'worktree'`; their branches are listed at the end and applied with `pisub apply <id>`.
 - Resume: pass the old workflow id as `resume`; unchanged `agent()` calls come from the cache. Give `inputs` for the files an agent reads so changes to them re-run it; `sh(cmd, { cache: true })` is not re-run once it succeeded.
@@ -80,6 +81,7 @@ node "{{PISUB}}" spawn --model <alias> --cwd <dir> --task-file <instructions fil
 - pi cannot see this conversation. Put paths, goal, constraints and output format in the task.
 - Put long instructions in a file and make the task "read <file> first".
 - Ask for machine-checkable output and keep a checking script, so cut corners show up.
+- Ask for a short final answer (a summary, counts, file paths) and have bulky output written to files. The final answer is all that enters your context, so keep it small and read the files only when you need them.
 
 ## Where things are
 - Each agent's run directory is `~/.pi-subagents/runs/<id>/`:
@@ -90,4 +92,4 @@ node "{{PISUB}}" spawn --model <alias> --cwd <dir> --task-file <instructions fil
   - `session/`: pi's session files
   - `journal.jsonl`: a workflow's results (for resume); `wt/`: an isolated agent's worktree
   - `serve.log`, `pi-stderr.log`: broker and pi logs
-- Config: `~/.pi-subagents/config.json`. Provider cooldowns: `~/.pi-subagents/accounts.json`.
+- Config: `~/.pi-subagents/config.json`. Provider cooldowns: `~/.pi-subagents/accounts.json`. Usage ledger: `~/.pi-subagents/usage/<year-month>.jsonl` (read it with `pisub usage`).

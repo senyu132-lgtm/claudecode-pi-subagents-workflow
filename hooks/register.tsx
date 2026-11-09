@@ -22,7 +22,7 @@ const P = 'pi-subagents'
 const PANE = 'pi-subagents'
 const toolName = (n: string) => `mcp__${P}__${n}`
 
-const agentsA = atom({ plugin: 'pi-subagents', key: 'agents' } as const, [] as AgentRow[], { shape: 'agents-4' })
+const agentsA = atom({ plugin: 'pi-subagents', key: 'agents' } as const, [] as AgentRow[], { shape: 'agents-5' })
 const mineA = atom({ plugin: 'pi-subagents', key: 'mine' } as const, [] as string[], { shape: 'mine-1' })
 const notifiedA = atom({ plugin: 'pi-subagents', key: 'notified' } as const, {} as Record<string, number>, { shape: 'notified-1' })
 // Agents that finished but have not been reported yet
@@ -34,6 +34,9 @@ const noticeA = atom({ plugin: 'pi-subagents', key: 'notice' } as const, '')
 const sendCountA = atom({ plugin: 'pi-subagents', key: 'sendCount' } as const, 0)
 // How the pane's input box sends: false = steer (after the current step), true = interrupt (stop the current step now)
 const interruptA = atom({ plugin: 'pi-subagents', key: 'interrupt' } as const, false)
+// Strict notices (noticeFallback: false in config.json): why finished results could not be delivered, shown above
+// the prompt with a retry button; '' when nothing is stuck
+const stuckA = atom({ plugin: 'pi-subagents', key: 'stuck' } as const, '')
 // The detail view shows the agent's whole record (the pane scrolls) instead of the last lines that fit
 const expandA = atom({ plugin: 'pi-subagents', key: 'expanded' } as const, false)
 // Whether the user turned workflows on in this session (/pi flow)
@@ -54,7 +57,8 @@ const MAX_LISTED = 40
 const BATCH_MS = 3000 // wait this long after the last result so results that land together share one notification
 const MAX_WAIT_MS = 15000 // but never hold the first one back longer than this
 
-type Ctx = { node: string; pisub: string; home: string; runs: string; sid: string; lang: string; tmp: string[] }
+// fallback: noticeFallback from config.json (false = strict: never send results as a plugin message)
+type Ctx = { node: string; pisub: string; home: string; runs: string; sid: string; lang: string; tmp: string[]; fallback: boolean }
 type Shell = 'Bash' | 'PowerShell'
 // Everything per session, keyed by session id, in case the host runs several sessions with one module
 type Sess = {
@@ -72,6 +76,7 @@ type Sess = {
   shell: Shell | '' | undefined // the shell tool used to deliver notices ('' = none; undefined = not looked up yet)
   noticeDir: string // where notice files go (Claude Code's temp folder for this project and session, when found)
   taskFailedAt: number // the background-task route failed then: use the fallback for a while
+  taskError: string // why it failed
 }
 const sessions = new Map<string, Sess>()
 async function sess($: EngineInterface): Promise<Sess> {
@@ -79,7 +84,7 @@ async function sess($: EngineInterface): Promise<Sess> {
   let s = sessions.get(sid)
   if (!s) {
     s = { ctx: null, active: false, polling: false, mainBusy: false, submitting: false, lastAddedAt: 0, firstPendingAt: 0, checked: new Map(), failures: 0, retryAt: 0, misses: new Map(),
-      shell: undefined, noticeDir: '', taskFailedAt: -Infinity }
+      shell: undefined, noticeDir: '', taskFailedAt: -Infinity, taskError: '' }
     sessions.set(sid, s)
   }
   return s
@@ -136,11 +141,11 @@ async function getCtx($: EngineInterface): Promise<Ctx> {
   let node = 'node'
   const r = await $.process.run([node, pisub, 'paths'], { timeoutMs: 20000 })
   if (r.exitCode !== 0) throw new Error(`pisub failed to start: ${r.stderr || r.stdout}`)
-  const paths = JSON.parse(r.stdout) as { home?: string; runs: string; node: string; lang?: string; tmp?: unknown }
+  const paths = JSON.parse(r.stdout) as { home?: string; runs: string; node: string; lang?: string; tmp?: unknown; noticeFallback?: unknown }
   node = paths.node || node
   const home = paths.home || paths.runs.replace(/[\\/]runs$/, '')
   const tmp = Array.isArray(paths.tmp) ? paths.tmp.filter((x): x is string => typeof x === 'string' && x !== '') : []
-  s.ctx = { node, pisub, home, runs: paths.runs, sid, lang: paths.lang === 'zh' ? 'zh' : 'en', tmp }
+  s.ctx = { node, pisub, home, runs: paths.runs, sid, lang: paths.lang === 'zh' ? 'zh' : 'en', tmp, fallback: paths.noticeFallback !== false }
   lang = s.ctx.lang
   return s.ctx
 }
@@ -174,6 +179,7 @@ function toRow(s: Record<string, unknown>): AgentRow {
     parent: str(s.parent),
     failed: num(s.failed),
     toolUses: num(s.toolUses),
+    tokens: num((s.usage as { total?: unknown } | undefined)?.total),
     finishedAt: num(s.finishedAt),
     phases: Array.isArray(s.phases)
       ? s.phases.map(x => (typeof x === 'string' ? x : x && typeof (x as { title?: unknown }).title === 'string' ? (x as { title: string }).title : '')).filter(Boolean)
@@ -354,7 +360,7 @@ const noticeCommand = (sh: Shell, file: string) => (sh === 'Bash' ? `cat '${file
 async function deliverAsTask($: EngineInterface, c: Ctx, s: Sess, text: string, description: string): Promise<boolean> {
   try {
     const sh = await pickShell($, s)
-    if (!sh) return false
+    if (!sh) throw new Error(L('this session has no Bash or PowerShell tool', '这个会话里没有 Bash 或 PowerShell 工具'))
     const file = `${await noticeDir($, c, s)}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.md`
     await $.fs.write(file, text)
     const r = (await $.tool.call({ tool: sh, command: noticeCommand(sh, file), run_in_background: true, description } as never)) as {
@@ -372,6 +378,7 @@ async function deliverAsTask($: EngineInterface, c: Ctx, s: Sess, text: string, 
   } catch (err) {
     if (/no tool named/i.test(String(err))) s.shell = undefined
     s.taskFailedAt = await $.clock.now()
+    s.taskError = err instanceof Error ? err.message : String(err)
     $.ui.log(`${P}: background-task notice failed, using the fallback: ${String(err)}`, { to: 'debug' })
     return false
   }
@@ -483,6 +490,12 @@ async function flushNotifications($: EngineInterface, c: Ctx, s: Sess) {
   try {
     // Right after a failed attempt the background-task route rests for 5 minutes instead of being retried every poll
     const viaTask = t - s.taskFailedAt >= 300000 && (await deliverAsTask($, c, s, L('[pi sub-agent results] ', '[pi 子代理结果] ') + body + '\n', desc))
+    if (!viaTask && !c.fallback) {
+      // Strict: nothing goes out in the user's place. The results stay pending (and stored); the line above the
+      // prompt says why and offers a retry, and the route is tried again by itself after its 5-minute rest.
+      await update($, stuckA, () => s.taskError || L('the background command failed', '后台命令失败'))
+      return
+    }
     if (!viaTask) {
       // Fallback: a plugin message, which has to wait until the main conversation's turn is over
       if (s.mainBusy) return
@@ -490,6 +503,7 @@ async function flushNotifications($: EngineInterface, c: Ctx, s: Sess) {
     }
     // Only now are they reported; until here they stay pending (and stored), so a crash cannot lose them
     await done()
+    await update($, stuckA, () => '')
     s.failures = 0
     s.retryAt = 0
     $.ui.toast(`${title()}: ${head}`)
@@ -604,6 +618,7 @@ function dur(ms: number) {
   return L(`${Math.floor(m / 60)}h ${m % 60}m`, `${Math.floor(m / 60)}小时${m % 60}分`)
 }
 const toolCount = (n: number) => L(`${n} tool ${n === 1 ? 'use' : 'uses'}`, `${n} 次工具调用`)
+const fmtTokens = (n: number) => (n < 1000 ? String(Math.round(n)) : n < 1e6 ? `${(n / 1e3).toFixed(n < 1e4 ? 1 : 0)}k` : `${(n / 1e6).toFixed(n < 1e7 ? 2 : 1)}M`)
 const cap = (s: string) => (s ? s[0]!.toUpperCase() + s.slice(1) : s)
 // `Bash(ls data/)`, as Claude Code writes a tool call
 const callText = (name: string, args: string | undefined, n: number) => `${cap(name || 'tool')}(${oneLine(args, n)})`
@@ -640,6 +655,7 @@ function endLine(r: AgentRow): Line {
     if (r.rounds > 1) parts.push(L(`${r.rounds} rounds`, `${r.rounds} 轮`))
     parts.push(toolCount(r.toolUses))
   }
+  if (r.tokens > 0) parts.push(`${fmtTokens(r.tokens)} tokens`)
   // A resumed agent's clock would count the idle time between rounds: only the first round is timed
   if (r.rounds <= 1 && r.createdAt && r.finishedAt > r.createdAt) parts.push(dur(r.finishedAt - r.createdAt))
   const word = r.status === 'done' ? L('Done', '完成') : r.status === 'error' ? L('Error', '出错') : L('Stopped', '已停止')
@@ -832,10 +848,11 @@ Available:
 - pipeline(items, stage1, stage2, ...): each item runs through all stages independently, without waiting for the others (use this by default). Stage arguments: (previous result, original item, index); an item whose stage throws or returns null becomes null.
 - parallel([() => ...]): returns when all are done; ones that throw become null.
 - phase(title), log(text), args (the value passed at start, as is).
-- sh(command string | [program, ...args], {cwd, timeoutSec, input, cache}) → {code, stdout, stderr}: run checking scripts (strings run in bash; Git bash on Windows). Every sh() runs again on resume unless cache: true, which reuses the output of a run that succeeded (exit code 0); use it for commands with side effects.
+- sh(command string | [program, ...args], {cwd, timeoutSec, input, cache, readonly}) → {code, stdout, stderr}: run checking scripts (strings run in bash; Git bash on Windows). Every sh() runs again on resume unless cache: true, which reuses the output of a run that succeeded (exit code 0); use it for commands with side effects. readonly: true marks a command that only reads, so a dry run runs it too.
 Always await agent() and sh(): the workflow waits for calls the script did not await, but their results are lost to it. If the script throws, its running agents are stopped. Agents that edit files at the same time in the same folder get a warning: give them isolation: 'worktree'.
 No file or Node APIs; let an agent do file work, or use sh. Concurrency per model alias comes from the user's config (default 4); meta.concurrency overrides it.
 pi cannot see this conversation: every prompt must state paths, goal, constraints and output format. Treat answers from weaker models as hints and cross-check them.
+Dry run: dryRun: true runs the script in seconds with fake agents and returns a report instead of starting anything: script errors with their line, how many agents of which model a real run would start (and how many the resume cache covers), sh() exit codes, problems such as an unknown model alias, and the return value computed from sample data. agent() returns sample data built from its schema (or a placeholder text); sh() runs only with readonly: true, the others return exit code 0 and no output. Do a dry run before a large or costly workflow, and after changing a script before resuming it.
 Resume: pass resume = the old workflow id; script/scriptPath may be omitted (the old script is reused, and so are its args if none are given). An agent() call whose prompt and options are unchanged returns the cached result; changed and new ones run. The cache does not see files: give inputs: ['data/', 'src/a.ts'] (paths relative to its cwd) for the files an agent reads, so it re-runs when their content changes, or cache: false to always run it. A cached result is also not reused when its model alias now points to another model. If the repository changed since the old run, the final notification warns that cached results may be stale.
 The transcript stays out of your context; the user sees phases and every agent in the /pi pane. To debug, use log on the workflow or on one of its agents, and status to list its agents.`
 
@@ -855,6 +872,7 @@ async function registerFlowTool($: EngineInterface) {
         scriptPath: { type: 'string', description: 'Absolute path of a script file (instead of script)' },
         args: { description: 'Passed to the script as args, as is; write arrays and objects as JSON values, not strings' },
         resume: { type: 'string', description: 'Resume: the old workflow id' },
+        dryRun: { type: 'boolean', description: 'true = check the script with fake agents and get a report; nothing starts and no model is called' },
         cwd: { type: 'string', description: 'Working directory, absolute (default: the session directory); agents and sh run here by default' },
       },
     },
@@ -1119,10 +1137,15 @@ export const register: Register = on => {
           '本会话没有开启 pi 工作流。要用户输入 /pi flow 开启后才能用（每个会话单独开启）。',
         ),
       }
-    const input = e as unknown as { script?: string; scriptPath?: string; args?: unknown; resume?: string; cwd?: string }
+    const input = e as unknown as { script?: string; scriptPath?: string; args?: unknown; resume?: string; cwd?: string; dryRun?: boolean }
     if (!input.script && !input.scriptPath && !input.resume) return { deny: 'one of script, scriptPath or resume is required' }
     const c = await getCtx($)
-    const spec = { script: input.script, scriptPath: input.scriptPath, args: input.args, resume: input.resume, cwd: input.cwd, owner: c.sid, origin: 'claude' }
+    const spec = { script: input.script, scriptPath: input.scriptPath, args: input.args, resume: input.resume, cwd: input.cwd, owner: c.sid, origin: 'claude', dryRun: input.dryRun === true }
+    if (spec.dryRun) {
+      // The report is the result, also when the script failed (exit code 1); nothing was started
+      const d = await pisub($, ['flow', 'run', '--stdin-json'], JSON.stringify(spec), 90000)
+      return d.out ? { result: d.out } : { deny: d.err || L('the dry run failed', '试运行失败') }
+    }
     const r = await pisub($, ['flow', 'run', '--stdin-json', '--json'], JSON.stringify(spec))
     if (!r.ok) return { deny: L(`the workflow did not start: ${r.err || r.out}`, `工作流没有启动：${r.err || r.out}`) }
     const info = JSON.parse(r.out) as { id: string; name: string; script: string }
@@ -1252,10 +1275,39 @@ export const register: Register = on => {
     const below = await next(e)
     if (e.props.hasSurvey) return below
     const mine = await read($, mineA)
-    if (mine.length === 0) return below
+    const stuck = await read($, stuckA)
+    const waiting = stuck ? (await read($, pendingA)).length : 0
     const busy = (await read($, agentsA)).filter(r => mine.includes(r.id) && !TERMINAL.has(r.status))
-    if (busy.length === 0) return below
+    if (busy.length === 0 && !waiting) return below
     const { Box, Text, Button } = $.ui.resolve(e)
+    // Strict notices: results that could not be delivered, why, and a way to try again now
+    const stuckLine = waiting ? (
+      <Box>
+        <Text color="warning" wrap="truncate-end">
+          ⚠ {L(`${waiting} pi ${waiting === 1 ? 'result' : 'results'} not delivered to Claude: ${stuck}`, `${waiting} 个 pi 结果没送到 Claude：${stuck}`)}
+        </Text>
+        <Button
+          key="pi-retry"
+          plain
+          label={L('  retry', '  重试')}
+          onPress={() =>
+            void (async () => {
+              const s = await sess($)
+              s.taskFailedAt = -Infinity
+              s.shell = undefined
+              await flushNotifications($, await getCtx($), s)
+            })()
+          }
+        />
+      </Box>
+    ) : null
+    if (busy.length === 0)
+      return (
+        <Box flexDirection="column">
+          {below}
+          {stuckLine}
+        </Box>
+      )
     const flows = busy.filter(r => r.kind === 'flow').length
     const agents = busy.length - flows
     const parts = [
@@ -1269,6 +1321,7 @@ export const register: Register = on => {
           <Text dimColor>● {parts.join(' · ')}</Text>
           <Button key="pi-open" plain dimColor label={L('  /pi to view', '  /pi 查看')} onPress={() => void select($, '').then(() => openPane($, true))} />
         </Box>
+        {stuckLine}
       </Box>
     )
   })

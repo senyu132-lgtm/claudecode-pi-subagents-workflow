@@ -274,7 +274,10 @@ const errText = e => (e && e.message ? e.message : String(e));
 // limits: { [model]: max, default }; stagger: { [model]: ms }
 // defaultModel: alias for agent() calls without opts.model ('' = pisub's default)
 // failFast: any agent that still fails after its retries ends the whole workflow with an error
-export async function runFlow({ src, args, defaultModel = '', limits = {}, stagger = {}, failFast = false, hooks }) {
+// dryRun: the hooks fake the agents (see pisub's dry run); no concurrency limits or start gaps, and a cap on the
+//         number of agent() calls, since a loop that waits for real answers would otherwise spin forever
+export const DRY_RUN_MAX_CALLS = 5000;
+export async function runFlow({ src, args, defaultModel = '', limits = {}, stagger = {}, failFast = false, dryRun = false, hooks }) {
   const h = {
     log: () => {},
     phase: () => {},
@@ -346,6 +349,11 @@ export async function runFlow({ src, args, defaultModel = '', limits = {}, stagg
     seen.set(key, n + 1);
     info.key = key;
     stats.calls++;
+    if (dryRun && stats.calls > DRY_RUN_MAX_CALLS) {
+      fatal = new Error(L(`more than ${DRY_RUN_MAX_CALLS} agent() calls in the dry run: is there a loop that never ends?`, `试运行里 agent() 调用超过 ${DRY_RUN_MAX_CALLS} 次：是不是有停不下来的循环？`));
+      fatal.fatal = true;
+      throw fatal;
+    }
     let hit = opts.cache === false ? null : h.cached(key, n);
     if (hit && hit.modelKey !== undefined && hit.modelKey !== modelKey) {
       h.log(L(`agent #${info.index} "${info.label}": ${model || 'default'} now means ${modelKey} (was ${hit.modelKey}), so it runs again instead of using the cache`, `代理 #${info.index}「${info.label}」：${model || '默认'} 现在指向 ${modelKey}（原来是 ${hit.modelKey}），不用缓存，重新运行`));
@@ -358,8 +366,8 @@ export async function runFlow({ src, args, defaultModel = '', limits = {}, stagg
       h.record(key, n, hit.value, { ...info, cached: true });
       return JSON.parse(JSON.stringify(hit.value));
     }
-    const g = gate(model);
-    await g.acquire();
+    const g = dryRun ? null : gate(model);
+    if (g) await g.acquire();
     try {
       let value = null;
       for (let attempt = 0; attempt <= retries; attempt++) {
@@ -396,7 +404,7 @@ export async function runFlow({ src, args, defaultModel = '', limits = {}, stagg
       h.record(key, n, value, info);
       return value;
     } finally {
-      g.release();
+      g?.release();
     }
   }
 

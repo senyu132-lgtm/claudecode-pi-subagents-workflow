@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { validate, checkSchema, SUPPORTED_KEYWORDS } from '../bin/schema.mjs';
+import { validate, checkSchema, sample, SUPPORTED_KEYWORDS } from '../bin/schema.mjs';
 import { setLanguage } from '../bin/i18n.mjs';
 
 const pair = (schema, good, bad) => {
@@ -137,4 +137,27 @@ test('a schema nested too deeply is refused with a message, not a crash', () => 
   let fine = { type: 'string' };
   for (let i = 0; i < 150; i++) fine = { items: fine };
   assert.equal(checkSchema(fine), null);
+});
+
+test('sample() makes data that matches the schema, for dry runs', () => {
+  const schemas = [
+    { type: 'object', properties: { answer: { type: 'string' } }, required: ['answer'] },
+    { type: 'object', properties: { verdict: { enum: ['ok', 'bad'] }, score: { type: 'integer', minimum: 3, maximum: 5 }, ratio: { type: 'number', exclusiveMinimum: 0, multipleOf: 0.5 } }, required: ['verdict', 'score'], additionalProperties: false },
+    { type: 'object', properties: { tags: { type: 'array', items: { type: 'string', minLength: 8 }, minItems: 3, uniqueItems: true } }, required: ['tags'] },
+    { type: 'object', properties: { pair: { type: 'array', prefixItems: [{ type: 'integer' }, { type: 'boolean' }], minItems: 2 } }, required: ['pair'] },
+    { type: 'object', properties: { v: { anyOf: [{ type: 'null' }, { type: 'string', maxLength: 3 }] }, k: { const: 'fixed' } }, required: ['v', 'k'] },
+    { type: 'object', allOf: [{ properties: { a: { type: 'string' } }, required: ['a'] }, { properties: { b: { type: 'integer' } }, required: ['b'] }] },
+    { $defs: { item: { type: 'object', properties: { id: { type: 'integer' } }, required: ['id'] } }, type: 'object', properties: { items: { type: 'array', items: { $ref: '#/$defs/item' } } }, required: ['items'] },
+    { type: 'object', properties: { n: { type: ['null', 'integer'] }, x: { type: 'string', examples: ['picked'] } }, required: ['n', 'x'] },
+  ];
+  for (const s of schemas) {
+    assert.equal(checkSchema(s), null, JSON.stringify(s));
+    const v = sample(s);
+    assert.equal(validate(s, v), null, JSON.stringify({ s, v }));
+  }
+  assert.deepEqual(sample(schemas[1]), { verdict: 'ok', score: 3, ratio: 1 });
+  assert.equal(sample(schemas[7]).x, 'picked');
+  // A pattern is not solved for: the caller sees that the sample does not match
+  const hard = { type: 'object', properties: { code: { type: 'string', pattern: '^[A-Z]{3}$' } }, required: ['code'] };
+  assert.equal(typeof validate(hard, sample(hard)), 'string');
 });

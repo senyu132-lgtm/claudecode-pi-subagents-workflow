@@ -35,6 +35,7 @@ type World = {
   tasks: { tool: string; command: string; description: string; bg: boolean; text: string }[] // the ones that went as a background command
   shell: 'Bash' | 'PowerShell' | '' // the shell tool the session has ('' = none)
   refuseTask?: boolean
+  strict?: boolean // config.json says noticeFallback: false
   tmp?: string[] // what pisub paths reports as temp folders
   dirs: Set<string> // folders that exist
   outDir?: string // where the engine says background output goes
@@ -103,7 +104,7 @@ function fakeEngine(on: On, lang = 'en'): World {
     w.calls.push({ argv: e.argv, stdin: e.init?.stdin })
     const cmd = e.argv[2]
     let stdout = ''
-    if (cmd === 'paths') stdout = JSON.stringify({ home: HOME, runs: RUNS, node: 'node', lang, ...(w.tmp ? { tmp: w.tmp } : {}) })
+    if (cmd === 'paths') stdout = JSON.stringify({ home: HOME, runs: RUNS, node: 'node', lang, ...(w.tmp ? { tmp: w.tmp } : {}), ...(w.strict ? { noticeFallback: false } : {}) })
     else if (cmd === 'spawn') stdout = JSON.stringify({ id: spawned++ === 0 ? ID : ID2, model: 'acme/model-a' })
     else if (cmd === 'send') stdout = `Delivered to ${e.argv[3]}`
     else if (cmd === 'models') stdout = '* strong  acme/model-a'
@@ -579,11 +580,11 @@ test('the spawn call is drawn like a sub-agent: its last tool calls while it run
 
   // Done: one line, as Claude Code ends a sub-agent's row
   w.mtime += 1
-  w.files[`${RUNS}/${ID}/state.json`] = JSON.stringify({ ...JSON.parse(state(ID, 'done', 1)), name: 'Row count', toolUses: 8, createdAt: 1000, finishedAt: 63000 })
+  w.files[`${RUNS}/${ID}/state.json`] = JSON.stringify({ ...JSON.parse(state(ID, 'done', 1)), name: 'Row count', toolUses: 8, createdAt: 1000, finishedAt: 63000, usage: { input: 12000, output: 345, total: 12345 } })
   w.files[`${RUNS}/${ID}/final.md`] = '1204 rows'
   await clock.advance(1600)
   const ui = await $.ui.mount({ plugin: 'pi-subagents', component: 'ToolUse', requestId: 'toolu_1', props, surface: 'terminal' })
-  expect(await ui.find({ type: 'Text', text: /Done \(8 tool uses · 1m 2s\)/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /Done \(8 tool uses · 12k tokens · 1m 2s\)/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /more tool uses/ })).toBeUndefined()
   // "view" opens the pane on this agent
   await ui.press({ key: 'open' })
@@ -797,4 +798,31 @@ test('with only PowerShell it uses Get-Content; if the background command is ref
   expect(w.prompts.length).toBe(1)
   expect(w.prompts[0]).toContain("B's answer")
   expect(w.prompts[0]).toContain('not a user message')
+})
+
+test('strict notices (noticeFallback: false): a refused background command never turns into a plugin message; the line above the prompt says why, and retry sends it', async ($, on) => {
+  const w = fakeEngine(on)
+  const clock = mock.clock(on)
+  w.strict = true
+  w.refuseTask = true
+  await $.session.start({ cwd: '/w', surface: 'desktop', isInteractive: true })
+  await $.tool.call({ tool: 'mcp__pi-subagents__spawn', task: 'A' } as never)
+  finish(w, ID, "A's answer")
+  await clock.advance(6000)
+  // Idle, long after: still nothing in the user's place
+  await clock.advance(120000)
+  expect(w.prompts.length).toBe(0)
+  expect(w.submitted.length).toBe(0)
+  const BAND = { plugin: 'pi-subagents', component: 'AbovePrompt', requestId: 'band', props: { hasSurvey: false, isWorking: false, maxRows: 10, bodyColumns: 120, scroll: { offset: 0, bodyRows: 10 }, view: {} } } as never
+  const ui = await $.ui.mount({ ...(BAND as object), surface: 'desktop' } as never)
+  expect(await ui.find({ type: 'Text', text: /1 pi result not delivered to Claude: refused/ })).toBeDefined()
+  // The background command is allowed again: retry delivers it as a background task, and the line goes away
+  w.refuseTask = false
+  await ui.press({ key: 'pi-retry' })
+  await clock.advance(1600)
+  expect(w.tasks.length).toBe(1)
+  expect(w.tasks[0]!.text).toContain("A's answer")
+  expect(w.prompts.length).toBe(0)
+  expect(await ui.find({ type: 'Text', text: /not delivered/ })).toBeUndefined()
+  await ui.unmount()
 })
