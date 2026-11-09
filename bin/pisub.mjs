@@ -7,7 +7,7 @@
 //   spawn  [--model alias|provider/model] [--thinking lvl] [--cwd dir] [--readonly] [--worktree]
 //          [--name name] [--owner session-id] [--wait] [--timeout sec] [--json]
 //          (--task-file file | --stdin | task text...)
-//   send   <id> [--mode steer|follow_up] [--from claude|user] [--wait] (--stdin | text...)
+//   send   <id> [--mode steer|interrupt|follow_up] [--from claude|user] [--wait] (--stdin | text...)
 //   status [id] [--owner session-id] [--json] [--limit N]
 //   log    <id> [--tail N] [--full]
 //   result <id> | wait <id> [--timeout sec] | stop <id>
@@ -279,7 +279,9 @@ function makeId(alias) {
   const t = new Date();
   const p2 = n => String(n).padStart(2, '0');
   const stamp = `${p2(t.getMonth() + 1)}${p2(t.getDate())}-${p2(t.getHours())}${p2(t.getMinutes())}${p2(t.getSeconds())}`;
-  const safe = String(alias).replace(/[^\w.-]/g, '').slice(0, 24) || 'pi';
+  // Only ASCII letters, digits, '_', '.', '-' survive, and never at the start a '-' or '.': a name like
+  // "审查-接口" would otherwise leave "-", and an id starting with "--" reads as an option on the command line.
+  const safe = String(alias).replace(/[^\w.-]/g, '').replace(/^[.-]+|[.-]+$/g, '').slice(0, 24).replace(/[.-]+$/, '') || 'pi';
   return `${safe}-${stamp}-${crypto.randomBytes(4).toString('hex')}`;
 }
 // A new run directory under a fresh id. Created exclusively, so two runs can never share a folder.
@@ -830,21 +832,28 @@ async function cmdSpawn(argv) {
 async function cmdSend(argv) {
   const o = parseArgs(argv, ['wait', 'stdin']);
   const id = checkId(o._.shift());
-  if (readState(id).kind === 'flow')
-    die(L(`${id} is a workflow and cannot be messaged. Message one of its agents instead (\`pisub status ${id}\` lists them).`, `${id} 是工作流，不能直接对话。请发给它下面的某个子代理（\`pisub status ${id}\` 可列出）。`));
+  const st = readState(id);
+  if (st.kind === 'flow')
+    die(L(`${id} is a workflow and cannot be messaged. Message one of its running agents instead (\`pisub status ${id}\` lists them).`, `${id} 是工作流，不能直接对话。请发给它下面还在运行的子代理（\`pisub status ${id}\` 可列出）。`));
+  // An agent is closed once it has given its final answer: it takes no more messages. To go on, start a new one.
+  // (A workflow's "resubmit in the right format" goes through enqueue directly and is not affected.)
+  if (TERMINAL.has(st.status)) {
+    const word = { done: L('finished', '完成'), error: L('ended with an error', '出错结束'), stopped: L('was stopped', '被停止') }[st.status] || st.status;
+    die(L(`${id} ${word} and is closed; it takes no more messages. To carry on, start a new agent and put what it needs (including this one's result) in the task.`, `${id} 已经${word}并关闭，不再接收消息。要接着做，请重新派一个代理，把需要的上下文（包括它的结果）写进任务。`));
+  }
   const text = await getText(o);
   if (!text.trim()) die(L('empty message', '没有消息内容'));
-  const mode = o.mode === 'follow_up' || o.mode === 'followUp' ? 'follow_up' : 'steer';
-  const before = readState(id).rounds || 0;
-  const running = isServing(id);
+  const mode = o.mode === 'follow_up' || o.mode === 'followUp' ? 'follow_up' : o.mode === 'interrupt' ? 'interrupt' : 'steer';
+  const before = st.rounds || 0;
   enqueue(id, { text, from: o.from || 'claude', mode });
   ensureServing(id);
   if (o.wait) return waitAndPrint(id, before, Number(o.timeout) || 0);
-  out(
-    running
-      ? L(`Delivered to ${id}: it is running, so the message arrives as ${mode === 'steer' ? 'a steer' : 'a follow-up'}.`, `已送达 ${id}：它正在运行，消息作为${mode === 'steer' ? '插话' : '追加任务'}交给它。`)
-      : L(`Delivered to ${id}: it had finished, so it resumes its previous session.`, `已送达 ${id}：它已结束，将接着原会话续做。`)
-  );
+  const how = {
+    steer: L('a steer (delivered once the current step is done)', '插话（当前这一步做完后送达）'),
+    follow_up: L('a follow-up (handled after the current task)', '追加任务（做完当前任务后处理）'),
+    interrupt: L('an interrupt (the current step is stopped and it switches to this now)', '打断（中止当前这一步，马上改做这条）'),
+  }[mode];
+  out(L(`Delivered to ${id}: it is running, so the message arrives as ${how}.`, `已送达 ${id}：它正在运行，消息作为${how}交给它。`));
 }
 
 function listStates(owner) {
@@ -943,7 +952,7 @@ function renderEntry(e, full) {
   const cut = (s, n) => (full ? String(s ?? '') : trunc(s, n));
   switch (e.k) {
     case 'user': {
-      const tag = `${FROM[e.from] || e.from}${e.mode && e.mode !== 'prompt' ? '·' + (e.mode === 'steer' ? L('steer', '插话') : L('follow-up', '追加')) : ''}`;
+      const tag = `${FROM[e.from] || e.from}${e.mode && e.mode !== 'prompt' ? '·' + ({ steer: L('steer', '插话'), follow_up: L('follow-up', '追加'), interrupt: L('interrupt', '打断') }[e.mode] || e.mode) : ''}`;
       return `[${t}] ${L(`[${tag}] `, `【${tag}】`)}${cut(e.text, 800)}`;
     }
     case 'thinking': return `[${t}] ${L('(thinking) ', '（思考）')}${cut(e.text, 300)}`;
@@ -1818,6 +1827,12 @@ class PiSession {
     this.idleAfterSettle = false; // the run settled while a message was being delivered
     this.rejected = ''; // why pi turned down the last prompt
     this.gaveUp = ''; // why the broker killed pi (hung, broken protocol)
+    // Interrupt (send --mode interrupt): abort the current step, wait until pi is idle, then send the new
+    // instruction as a prompt. While `interrupting`, the agent_settled that the abort brings does not end the round;
+    // `gen` goes up with every interrupt, so a resume planned before it (account switch, backoff) is dropped.
+    this.interrupting = false;
+    this.gen = 0;
+    this.wakeRetry = null;
   }
   view(entry) {
     appendPrivate(path.join(this.dir, 'view.jsonl'), JSON.stringify({ t: now(), ...entry }) + '\n');
@@ -2139,6 +2154,7 @@ class PiSession {
     if (this.idleAfterSettle) return this.finalize('done');
   }
   async deliver(msg) {
+    if (this.busy && msg.mode === 'interrupt') return this.interrupt(msg);
     if (this.busy) {
       const entry = { text: msg.text, from: msg.from || 'claude', mode: msg.mode };
       this.sent.push(entry);
@@ -2169,6 +2185,52 @@ class PiSession {
       this.busy = false;
       this.idleAfterSettle = true;
       this.view({ k: 'info', text: L('pi handled the message itself; no model run was started', 'pi 自己处理了这条消息，没有启动模型运行') });
+    }
+    return r;
+  }
+  // Interrupt: stop the current step (an answer half written, a command half run are dropped), wait until pi is
+  // idle, then send the new instruction as a prompt in the same session.
+  // Tested with pi 1.5.0: steer-then-abort aborts the queued message too and the model never answers; so abort
+  // first (pi answers it once idle), then prompt. pi sends agent_settled{aborted:true} before it answers the abort.
+  async interrupt(msg) {
+    this.gen++;
+    this.view({ k: 'info', text: L('Interrupted: stopping the current step and switching to the new instruction', '收到打断：中止当前这一步，马上改做新要求') });
+    this.interrupting = true;
+    try {
+      if (this.waitingRetry) {
+        // Waiting out an overload (pi is idle anyway): cut the wait short and do not resume the old step
+        this.wakeRetry?.();
+      } else {
+        try {
+          const r = await this.send({ type: 'abort' }, 15000);
+          if (!r.success) this.view({ k: 'error', text: L(`could not stop the current step: ${r.error}; sending the new instruction anyway`, `中止当前这一步失败：${r.error}；仍尝试发送新要求`) });
+        } catch (e) {
+          if (this.closing) throw e;
+          this.view({ k: 'error', text: L(`could not stop the current step: ${e.message}; sending the new instruction anyway`, `中止当前这一步失败：${e.message}；仍尝试发送新要求`) });
+        }
+      }
+      // Let the events the abort brought (in the same batch of output) be handled first
+      await sleep(50);
+    } finally {
+      this.interrupting = false;
+    }
+    if (this.closing || this.stopping) return { success: true };
+    const entry = { text: msg.text, from: msg.from || 'claude', mode: 'interrupt' };
+    this.sent.push(entry);
+    this.lastAssistant = null;
+    this.retries = 0;
+    this.busy = true;
+    this.idleAfterSettle = false;
+    this.rejected = '';
+    this.state({ status: 'running' });
+    // If pi did not stop after all, streamingBehavior turns this into a steer instead of a refusal
+    const r = await this.send({ type: 'prompt', message: msg.text, streamingBehavior: 'steer' });
+    if (!r.success) {
+      const i = this.sent.lastIndexOf(entry);
+      if (i >= 0) this.sent.splice(i, 1);
+      this.busy = false;
+      this.rejected = L(`after the interrupt pi turned the new instruction down: ${r.error} (message: ${trunc(msg.text, 200)})`, `打断后 pi 拒收了新要求：${r.error}（消息：${trunc(msg.text, 200)}）`);
+      this.view({ k: 'error', text: this.rejected });
     }
     return r;
   }
@@ -2236,7 +2298,9 @@ class PiSession {
             if (c.type === 'thinking' && c.thinking?.trim()) this.view({ k: 'thinking', text: trunc(c.thinking, 4000) });
             else if (c.type === 'text' && c.text?.trim()) this.view({ k: 'text', text: trunc(c.text, 40000) });
           }
-          if (m.stopReason === 'error') this.view({ k: 'error', text: m.errorMessage || L('unknown error', '未知错误') });
+          // The step cut off by an interrupt or a stop also ends with an error ("This operation was aborted"): expected, just note it
+          if (m.stopReason === 'error')
+            this.view(this.interrupting || this.stopping ? { k: 'info', text: L('the current step was stopped', '当前这一步已中止') } : { k: 'error', text: m.errorMessage || L('unknown error', '未知错误') });
           this.live = { text: '', thinking: '', tool: '' };
           this.writeLive(true);
         }
@@ -2284,7 +2348,9 @@ class PiSession {
     }
   }
   async onSettled(rec) {
-    if (this.closing) return;
+    // The settle that an interrupt's abort brings: interrupt() sends the new instruction, the round goes on
+    if (this.closing || this.interrupting) return;
+    const gen = this.gen;
     const st = readState(this.id);
     if (this.stopping) return this.finalize('stopped');
     let last = this.lastAssistant;
@@ -2306,6 +2372,8 @@ class PiSession {
             this.view({ k: 'info', text: L(`${st.provider} hit its usage limit; carrying on with ${next}`, `${st.provider} 额度用完，换成 ${next} 接着做`) });
             this.state({ provider: next, accountsTried: [...new Set([...(st.accountsTried || []), next])] });
             this.lastAssistant = null;
+            // Interrupted while switching: the new instruction is already running, do not resume the old step
+            if (gen !== this.gen) return;
             return this.resume();
           }
           this.view({ k: 'error', text: L(`switching to ${next} failed: ${r.error}`, `切换到 ${next} 失败：${r.error}`) });
@@ -2317,9 +2385,17 @@ class PiSession {
         this.state({ status: 'waiting' });
         this.view({ k: 'retry', text: L(`service unavailable; retrying in ${sec}s (attempt ${this.retries}): ${trunc(err, 300)}`, `服务暂时不可用，${sec} 秒后再试（第 ${this.retries} 次）：${trunc(err, 300)}`) });
         this.waitingRetry = true;
-        await sleep(sec * 1000);
+        // An interrupt can cut this wait short
+        await new Promise(resolve => {
+          const timer = setTimeout(resolve, sec * 1000);
+          this.wakeRetry = () => {
+            clearTimeout(timer);
+            resolve();
+          };
+        });
+        this.wakeRetry = null;
         this.waitingRetry = false;
-        if (this.closing || this.stopping) return;
+        if (this.closing || this.stopping || gen !== this.gen) return;
         this.lastAssistant = null;
         return this.resume();
       }
@@ -2402,8 +2478,10 @@ const HELP_EN = `pisub: run the pi coding agent as a background sub-agent
          Without --model: the configured defaultAlias, or pi's own default model.
          --worktree: work in its own git worktree (branch pi/<id>) instead of your files; its changes are
          committed on that branch, and the final answer says how to review and apply them.
-  send   <id> [--mode steer|follow_up] [--from claude|user] [--wait] (--text-file file | --stdin | text)
-         Message it: while running = steer (or follow_up); after it finished = resume its previous session.
+  send   <id> [--mode steer|interrupt|follow_up] [--from claude|user] [--wait] (--text-file file | --stdin | text)
+         Message a running agent: steer (default; delivered once the current step is done), interrupt (stop the
+         current step and switch to this now) or follow_up (after the current task). An agent that has given its
+         final answer is closed and takes no more messages.
   status [id] [--owner session-id] [--json] [--limit N]   show status
   log    <id> [--tail N] [--full] [--json]                show what it did
   result <id>                                             print its final answer
@@ -2435,8 +2513,9 @@ const HELP_ZH = `pisub —— 把 pi 编码代理当后台子代理用
          不写 --model：用配置里的 defaultAlias，没有就用 pi 自己的默认模型。
          --worktree：在它自己的 git worktree（分支 pi/<编号>）里干活，不碰你的文件；改动提交到这个分支，
          最终回答里会写怎么查看和应用。
-  send   <id> [--mode steer|follow_up] [--from claude|user] [--wait] (--text-file 文件 | --stdin | 文本)
-         给它发消息：运行中=插话（steer）或追加（follow_up）；已结束=接着原会话续做。
+  send   <id> [--mode steer|interrupt|follow_up] [--from claude|user] [--wait] (--text-file 文件 | --stdin | 文本)
+         给运行中的代理发消息：插话（steer，默认，当前这一步做完后送达）、打断（interrupt，中止当前这一步、
+         马上改做这条）或追加（follow_up，做完当前任务后处理）。交出最终回答的代理已关闭，不再接收消息。
   status [id] [--owner 会话id] [--json] [--limit N]    查看状态
   log    <id> [--tail N] [--full] [--json]            查看工作过程
   result <id>                                         输出最终回答
@@ -2460,7 +2539,33 @@ const HELP_ZH = `pisub —— 把 pi 编码代理当后台子代理用
 语言：中文（config.json 里 "language": "en" 或 PISUB_LANG=en 切换为英文）`;
 
 const [cmd, ...rest] = process.argv.slice(2);
-const cmdPaths = () => out(JSON.stringify({ home: HOME, runs: RUNS, config: CONFIG_FILE, pisub: SELF, node: process.execPath, lang: language() }));
+// Completion notices that could not go into Claude's own temp folder are written to HOME/notify/<session>/;
+// they are only read once, so anything older than a week can go
+function cleanNotices() {
+  const root = path.join(HOME, 'notify');
+  let dirs = [];
+  try { dirs = fs.readdirSync(root); } catch { return; }
+  const old = now() - 7 * 86400000;
+  for (const d of dirs) {
+    const dir = path.join(root, d);
+    try {
+      for (const f of fs.readdirSync(dir)) {
+        const file = path.join(dir, f);
+        try { if (fs.statSync(file).mtimeMs < old) fs.unlinkSync(file); } catch {}
+      }
+      if (!fs.readdirSync(dir).length) fs.rmdirSync(dir);
+    } catch {}
+  }
+}
+// The mod asks for these once per session. `tmp` is where it looks for Claude Code's per-project temp folder
+// (the completion notices go there, so reading them needs no permission prompt).
+const cmdPaths = () => {
+  cleanNotices();
+  let real = '';
+  try { real = fs.realpathSync(os.tmpdir()); } catch {}
+  const tmp = [...new Set([os.tmpdir(), real].filter(Boolean))];
+  out(JSON.stringify({ home: HOME, runs: RUNS, config: CONFIG_FILE, pisub: SELF, node: process.execPath, lang: language(), tmp }));
+};
 const table = {
   paths: cmdPaths,
   spawn: cmdSpawn,

@@ -15,7 +15,8 @@ const PANE = {
   },
 } as const
 
-const RUNS = '/home/u/.pi-subagents/runs'
+const HOME = '/home/u/.pi-subagents'
+const RUNS = `${HOME}/runs`
 const ID = 'strong-1109-120000-abc'
 const ID2 = 'cheap-1109-120001-def'
 
@@ -29,7 +30,15 @@ type World = {
   files: Record<string, string>
   mtime: number
   calls: { argv: readonly string[]; stdin?: string }[]
-  submitted: string[]
+  submitted: string[] // every notice delivered, by either route
+  prompts: string[] // the ones that went as a plugin message (the fallback)
+  tasks: { tool: string; command: string; description: string; bg: boolean; text: string }[] // the ones that went as a background command
+  shell: 'Bash' | 'PowerShell' | '' // the shell tool the session has ('' = none)
+  refuseTask?: boolean
+  tmp?: string[] // what pisub paths reports as temp folders
+  dirs: Set<string> // folders that exist
+  outDir?: string // where the engine says background output goes
+  logs: string[]
   deferred: boolean[]
   tools: string[]
   store: Map<string, unknown>
@@ -39,8 +48,36 @@ type World = {
 
 // No real processes or files in tests: these hooks play the engine and pisub
 function fakeEngine(on: On, lang = 'en'): World {
-  const w: World = { files: {}, mtime: 1, calls: [], submitted: [], deferred: [], tools: [], store: new Map() }
+  const w: World = { files: {}, mtime: 1, calls: [], submitted: [], prompts: [], tasks: [], shell: 'Bash', dirs: new Set(), logs: [], deferred: [], tools: [], store: new Map() }
   let spawned = 0
+  on('tool.list', () => ({ value: w.shell ? [{ name: w.shell, description: '', mcp: false }] : [] }))
+  // The background command that prints a notice file: record it and what the file says
+  on('tool.call', { tool: /^(Bash|PowerShell)$/ }, (_, e) => {
+    const input = e as unknown as { tool: string; command: string; description?: string; run_in_background?: boolean }
+    if (w.refuseTask) return { deny: 'refused' }
+    const file = /'([^']+)'$/.exec(input.command)?.[1] ?? ''
+    const text = w.files[norm(file)] ?? ''
+    w.tasks.push({ tool: input.tool, command: input.command, description: input.description ?? '', bg: input.run_in_background === true, text })
+    w.submitted.push(text)
+    const id = `b${w.tasks.length}`
+    const where = w.outDir ? ` Output is being written to: ${w.outDir}\\tasks\\${id}.output. You will be notified when it completes.` : ''
+    return { result: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: id } as never, text: `Command running in background with ID: ${id}.${where}` }
+  })
+  // The engine's own permission check (stands for auto mode allowing it)
+  on('tool.check', () => ({ decision: 'allow', reason: 'engine' }))
+  on('fs.exists', (_, e) => ({ value: w.dirs.has(e.path.replace(/\\/g, '/')) }))
+  on('fs.write', (_, e) => {
+    w.files[norm(e.path)] = e.text
+    return { value: undefined }
+  })
+  on('session.root', () => ({ value: 'E:\\work\\sales-report' }))
+  on('session.cwd', () => ({ value: 'E:\\work\\sales-report' }))
+  on('ui.log', (_, e) => {
+    w.logs.push(String((e as { text?: unknown }).text ?? JSON.stringify(e)))
+    return { value: undefined } as never
+  })
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
+  on('turn.complete', (_, e) => ({ text: e.answer }))
   on('store.get', (_, e) => ({ value: w.store.get(e.key) }))
   on('store.set', (_, e) => {
     w.store.set(e.key, e.value)
@@ -66,7 +103,7 @@ function fakeEngine(on: On, lang = 'en'): World {
     w.calls.push({ argv: e.argv, stdin: e.init?.stdin })
     const cmd = e.argv[2]
     let stdout = ''
-    if (cmd === 'paths') stdout = JSON.stringify({ runs: RUNS, node: 'node', lang })
+    if (cmd === 'paths') stdout = JSON.stringify({ home: HOME, runs: RUNS, node: 'node', lang, ...(w.tmp ? { tmp: w.tmp } : {}) })
     else if (cmd === 'spawn') stdout = JSON.stringify({ id: spawned++ === 0 ? ID : ID2, model: 'acme/model-a' })
     else if (cmd === 'send') stdout = `Delivered to ${e.argv[3]}`
     else if (cmd === 'models') stdout = '* strong  acme/model-a'
@@ -93,6 +130,7 @@ function fakeEngine(on: On, lang = 'en'): World {
   on('prompt.submit', (_, e) => {
     w.tries = (w.tries ?? 0) + 1
     if (w.refuseSubmit) throw new Error('host busy')
+    w.prompts.push(e.text)
     w.submitted.push(e.text)
     return { text: e.text }
   })
@@ -171,6 +209,17 @@ test('spawn passes the session id to pisub and reports only the final answer', a
   await clock.advance(1600)
   expect(w.submitted.length).toBe(0)
 
+  // send: a steer by default; interrupt and follow_up are passed on; anything else is a steer
+  const sendArgs = () => w.calls.filter(c => c.argv[2] === 'send').at(-1)?.argv ?? []
+  await $.tool.call({ tool: 'mcp__pi-subagents__send', id: ID, message: 'also by region' } as never)
+  expect(sendArgs().slice(-2)).toEqual(['--mode', 'steer'])
+  await $.tool.call({ tool: 'mcp__pi-subagents__send', id: ID, message: 'wrong file, use sales-2025.csv', mode: 'interrupt' } as never)
+  expect(sendArgs().slice(-2)).toEqual(['--mode', 'interrupt'])
+  await $.tool.call({ tool: 'mcp__pi-subagents__send', id: ID, message: 'then a summary', mode: 'follow_up' } as never)
+  expect(sendArgs().slice(-2)).toEqual(['--mode', 'follow_up'])
+  await $.tool.call({ tool: 'mcp__pi-subagents__send', id: ID, message: 'x', mode: 'whatever' } as never)
+  expect(sendArgs().slice(-2)).toEqual(['--mode', 'steer'])
+
   // Finished: wait a moment, then notify once with the final answer
   finish(w, ID, 'Final answer: 1204 rows.')
   await clock.advance(1600)
@@ -179,13 +228,24 @@ test('spawn passes the session id to pisub and reports only the final answer', a
   expect(w.submitted.length).toBe(1)
   expect(w.submitted[0]).toContain('Final answer: 1204 rows.')
   expect(w.submitted[0]).toContain(ID)
-  expect(w.submitted[0]).toContain('not a user message')
+  // As a background command that prints the notice file, not as a message in the user's name
+  expect(w.prompts.length).toBe(0)
+  const task = w.tasks[0]!
+  expect(task.tool).toBe('Bash')
+  expect(task.bg).toBe(true)
+  expect(task.command).toMatch(new RegExp(`^cat '${HOME}/notify/sid-test/\\d+-[a-z0-9]+\\.md'$`))
+  expect(task.description).toBe('pi sub-agent Count the rows in sales.csv done')
+  expect(task.text).toMatch(/^\[pi sub-agent results\] /)
+  expect(task.text).toContain('closed now')
+  expect(task.text).not.toContain('round 1')
+  expect(task.text).not.toContain('mcp__pi-subagents__send')
+  expect(w.logs).toEqual([])
 
   // No duplicate notification
   await clock.advance(6000)
   expect(w.submitted.length).toBe(1)
 
-  // It is in the pane list; clicking shows its work; the input box sends through pisub send
+  // It is in the pane list and clicking shows its work; it is finished, so there is no input box
   w.files[`${RUNS}/${ID}/view.jsonl`] =
     JSON.stringify({ t: 1, k: 'user', from: 'claude', mode: 'prompt', text: 'Count the rows in sales.csv' }) +
     '\n' +
@@ -199,11 +259,8 @@ test('spawn passes the session id to pisub and reports only the final answer', a
     await ui.press({ key: `a-${ID}` })
     await clock.advance(1600)
     expect(await ui.find({ type: 'Text', text: /Bash\(ls\)/ })).toBeDefined()
-    // Each message gives the input a new key, which clears it
-    await ui.input({ key: `msg-${i}`, text: 'Check it once more' })
-    const sent = w.calls.filter(c => c.argv[2] === 'send')
-    expect(sent.at(-1)?.stdin).toBe('Check it once more')
-    expect(sent.at(-1)?.argv).toContain('user')
+    expect(await ui.find({ key: `msg-${i}` })).toBeUndefined()
+    expect(await ui.find({ key: 'mode' })).toBeUndefined()
     await ui.press({ key: 'back' })
     await ui.unmount()
   }
@@ -218,7 +275,7 @@ test('status with models=true lists the configured aliases', async ($, on) => {
   expect(w.calls.some(c => c.argv[2] === 'models')).toBe(true)
 })
 
-test('agents started by a script: a steer while running does not adopt; resuming after it finished does', async ($, on) => {
+test('agents started by a script: messages from the pane while it runs (steer or interrupt) do not adopt it; once finished it takes none', async ($, on) => {
   const w = fakeEngine(on)
   const clock = mock.clock(on)
   await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
@@ -232,20 +289,31 @@ test('agents started by a script: a steer while running does not adopt; resuming
   await ui.press({ key: `a-${ID}` })
   await clock.advance(1600)
 
-  // Steer while running: the script gets the result, the plugin does not notify
+  // A steer while running goes to pisub send, marked as from the user
+  const sends = () => w.calls.filter(c => c.argv[2] === 'send')
+  expect(await ui.find({ key: 'msg-0' })).toBeDefined()
   await ui.input({ key: 'msg-0', text: 'Also check the edge cases' })
-  finish(w, ID, 'first-round answer')
+  expect(sends().at(-1)?.stdin).toBe('Also check the edge cases')
+  expect(sends().at(-1)?.argv).toContain('user')
+  expect(sends().at(-1)?.argv).toContain('steer')
+
+  // Switched to "interrupt now", the next message interrupts; after it the switch is back on steer
+  await ui.press({ key: 'mode' })
+  expect(await ui.find({ type: 'Text', text: /interrupt now/ })).toBeDefined()
+  await ui.input({ key: 'msg-1', text: 'Wrong file, use sales-2025.csv' })
+  expect(sends().at(-1)?.argv).toContain('interrupt')
+  await ui.input({ key: 'msg-2', text: 'And sort by month' })
+  expect(sends().at(-1)?.argv).toContain('steer')
+
+  // The script gets the result, the plugin does not notify
+  finish(w, ID, 'the answer')
   await clock.advance(8000)
   expect(w.submitted.length).toBe(0)
 
-  // Resume after it finished: adopted into this session, round two is reported
-  await ui.input({ key: 'msg-1', text: 'Also break it down by region' })
-  await clock.advance(1600)
-  finish(w, ID, 'second-round answer', 2)
-  await clock.advance(8000)
-  expect(w.submitted.length).toBe(1)
-  expect(w.submitted[0]).toContain('second-round answer')
-  expect(w.submitted[0]).not.toContain('first-round answer')
+  // Finished: closed, so the input box and the switch are gone
+  expect(await ui.find({ key: 'msg-3' })).toBeUndefined()
+  expect(await ui.find({ key: 'mode' })).toBeUndefined()
+  expect(sends().length).toBe(3)
   await ui.unmount()
 })
 
@@ -275,24 +343,37 @@ test('workflows: no tool and calls refused until /pi flow; then registered and r
   w.mtime += 1
   w.files[`${RUNS}/${WF}/state.json`] = JSON.stringify({
     id: WF, kind: 'flow', name: 'demo', alias: 'flow', provider: '', model: 'workflow', status: 'done', task: 'demo', owner: 'sid-test',
-    cwd: '/w', createdAt: 3, updatedAt: 4, rounds: 1, progress: 'phase 1/1 "Analyze" · done 1/1',
+    cwd: '/w', createdAt: 3, updatedAt: 4, rounds: 1, progress: 'phase 2/2 "Check" · done 1/1',
+    phases: [{ title: 'Analyze' }, { title: 'Check' }], currentPhase: 'Check',
     children: [{ index: 1, label: 'Dataset 1', phase: 'Analyze', model: 'cheap', status: 'done', id: KID }],
   })
+  // The "Check" phase holds no agent, it only ran a script
+  w.files[`${RUNS}/${WF}/view.jsonl`] = [
+    { t: 1, k: 'phase', text: 'Analyze' },
+    { t: 2, k: 'agent', ev: 'done', label: 'Dataset 1', id: KID },
+    { t: 3, k: 'phase', text: 'Check' },
+    { t: 4, k: 'sh', text: 'python check_totals.py', code: 0 },
+  ].map(x => JSON.stringify(x) + '\n').join('')
   w.files[`${RUNS}/${WF}/final.md`] = '(Workflow "demo": …)\n\nreturn value 42'
   w.files[`${RUNS}/${KID}/state.json`] = JSON.stringify({ ...JSON.parse(state(KID, 'done', 1)), parent: WF, owner: WF, name: 'Dataset 1' })
   await clock.advance(6000)
   expect(w.submitted.length).toBe(1)
   expect(w.submitted[0]).toContain('return value 42')
   expect(w.submitted[0]).toContain('model="workflow"')
+  expect(w.tasks[0]!.description).toBe('pi workflow demo done')
 
-  // Pane: the workflow detail lists its agents; open one, then go back to the workflow
+  // Pane: the workflow detail lists its agents and the phase that only ran a check; open an agent (finished:
+  // no input box), then go back to the workflow
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   await ui.press({ key: `a-${WF}` })
   await clock.advance(1600)
   expect(await ui.find({ type: 'Text', text: /Analyze/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /done · 1 command/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /not started/ })).toBeUndefined()
   await ui.press({ key: 'c-1' })
   await clock.advance(1600)
   expect(await ui.find({ type: 'Button', key: 'back' })).toBeDefined()
+  expect(await ui.find({ key: 'msg-0' })).toBeUndefined()
   await ui.press({ key: 'back' })
   await clock.advance(1600)
   expect(await ui.find({ type: 'Text', text: /Analyze/ })).toBeDefined()
@@ -339,6 +420,7 @@ test('two agents finishing close together share one notification', async ($, on)
   expect(w.submitted[0]).toContain("A's answer")
   expect(w.submitted[0]).toContain("B's answer")
   expect(w.submitted[0]).toContain('2 agents have new results')
+  expect(w.tasks[0]!.description).toMatch(/^2 pi sub-agents have results: /)
 })
 
 // Agents the session was waiting for when it last stopped, as the plugin stores them
@@ -346,7 +428,7 @@ function seedSession(w: World, ids: string[]) {
   w.store.set('notify:sid-test', { at: Date.now(), mine: ids, notified: Object.fromEntries(ids.map(id => [id, 0])), pending: [] })
 }
 
-test('a restarted session reports what finished meanwhile; 30 long results fit one bounded notification', async ($, on) => {
+test('a restarted session reports what finished meanwhile; 30 long results stay within one bounded notification', async ($, on) => {
   const w = fakeEngine(on)
   const clock = mock.clock(on)
   const ids = Array.from({ length: 30 }, (_, i) => `job-1109-1200${String(i).padStart(2, '0')}-aaa`)
@@ -357,8 +439,10 @@ test('a restarted session reports what finished meanwhile; 30 long results fit o
   await clock.advance(4000)
   expect(w.submitted.length).toBe(1)
   const text = w.submitted[0]!
-  expect(text.length).toBeLessThan(60000)
-  for (const id of ids) expect(text).toContain(`answer of ${id}`)
+  // Claude reads the notice with Read: it stays near 16 000 characters (10 answers of 1 600; the rest by id)
+  expect(text.length).toBeLessThan(25000)
+  for (const id of ids.slice(0, 10)) expect(text).toContain(`answer of ${id}`)
+  for (const id of ids.slice(10)) expect(text).toContain(`- ${id} (done)`)
   expect(text).toContain('truncated="true"')
   expect(text).toContain('TRUNCATED: only the first')
   // Reported, and the stored record says so
@@ -378,9 +462,10 @@ test('more results than fit are listed by id to fetch, still within the limit', 
   await clock.advance(4000)
   expect(w.submitted.length).toBe(1)
   const text = w.submitted[0]!
-  expect(text.length).toBeLessThan(60000)
+  expect(text.length).toBeLessThan(25000)
   expect(text).toContain('not included, read each with mcp__pi-subagents__result')
-  expect(text).toContain(`- ${ids[69]} (done)`)
+  expect(text).toContain(`- ${ids[49]} (done)`)
+  expect(text).toContain('… and 20 more')
 })
 
 test('results that keep coming are not held back past the maximum wait', async ($, on) => {
@@ -401,6 +486,7 @@ test('results that keep coming are not held back past the maximum wait', async (
 
 test('a notification the host did not take stays stored and is sent on a later poll', async ($, on) => {
   const w = fakeEngine(on)
+  w.shell = '' // no shell tool: the fallback, a plugin message
   w.refuseSubmit = true
   const clock = mock.clock(on)
   seedSession(w, [ID])
@@ -463,7 +549,8 @@ test('Chinese UI when pisub reports language zh', async ($, on) => {
   finish(w, ID, '成立。')
   await clock.advance(6000)
   expect(w.submitted.length).toBe(1)
-  expect(w.submitted[0]).toContain('pi 子代理自动通知')
+  expect(w.submitted[0]).toMatch(/^\[pi 子代理结果\] /)
+  expect(w.tasks[0]!.description).toBe('pi 子代理 Count the rows in sales.csv 完成')
   await ui.unmount()
 })
 
@@ -516,8 +603,9 @@ test('the spawn call is drawn like a sub-agent: its last tool calls while it run
   await again.unmount()
 })
 
-test('the completion notice is drawn as one line per agent; the model still reads the whole text', async ($, on) => {
+test('the fallback notice is drawn as one line per agent; the model still reads the whole text', async ($, on) => {
   const w = fakeEngine(on)
+  w.shell = '' // no shell tool: the fallback, a plugin message
   const clock = mock.clock(on)
   await $.session.start({ cwd: '/w', surface: 'desktop', isInteractive: true })
   await $.tool.call({ tool: 'mcp__pi-subagents__spawn', task: 'Count the rows in sales.csv' } as never)
@@ -597,8 +685,9 @@ test("the earlier lines of an agent's record open with one press, and fold back"
   await ui.unmount()
 })
 
-test("the desktop has no ctrl+o: an expanded notice is still one line there; ctrl+o on the terminal shows it all", async ($, on) => {
+test("the desktop has no ctrl+o: an expanded fallback notice is still one line there; ctrl+o on the terminal shows it all", async ($, on) => {
   const w = fakeEngine(on)
+  w.shell = '' // no shell tool: the fallback, a plugin message
   const clock = mock.clock(on)
   // Stands for the engine's own drawing of the row
   on('ui.render', { component: 'UserMessage' }, ($, e) => {
@@ -624,6 +713,7 @@ test("the desktop has no ctrl+o: an expanded notice is still one line there; ctr
 
 test('a notification the host keeps refusing is tried less and less often, then sent', async ($, on) => {
   const w = fakeEngine(on)
+  w.shell = '' // no shell tool: the fallback, a plugin message
   w.refuseSubmit = true
   const clock = mock.clock(on)
   seedSession(w, [ID])
@@ -653,4 +743,58 @@ test('a result whose state cannot be read yet stays pending and is sent once it 
   await clock.advance(1600)
   expect(w.submitted.length).toBe(1)
   expect(w.submitted[0]).toContain('late but here')
+})
+
+test("the notice file goes in Claude Code's temp folder for the project; later, where the engine says output goes", async ($, on) => {
+  const w = fakeEngine(on)
+  const clock = mock.clock(on)
+  w.tmp = ['C:\\Temp']
+  // The project path with every non-alphanumeric turned into "-", lower-cased, sha256, first 16 hex digits
+  const name = 'E:\\work\\sales-report'.replace(/[^a-zA-Z0-9]/g, '-').toLowerCase()
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(name)))
+  const hash = [...digest].map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 16)
+  w.dirs.add(`C:/Temp/claude/${hash}`)
+  w.outDir = 'C:\\Temp2\\claude\\abc\\sid-test'
+  await $.session.start({ cwd: '/w', surface: 'desktop', isInteractive: true })
+  await $.tool.call({ tool: 'mcp__pi-subagents__spawn', task: 'A' } as never)
+  finish(w, ID, "A's answer")
+  await clock.advance(6000)
+  expect(w.tasks.length).toBe(1)
+  expect(w.tasks[0]!.command).toMatch(new RegExp(`^cat 'C:/Temp/claude/${hash}/sid-test/pi-subagents/\\d+-[a-z0-9]+\\.md'$`))
+  expect(w.tasks[0]!.text).toContain("A's answer")
+
+  // The engine said its output goes to C:\\Temp2\\claude\\abc\\sid-test\\tasks: the next notice goes next to it
+  await $.tool.call({ tool: 'mcp__pi-subagents__spawn', task: 'B' } as never)
+  finish(w, ID2, "B's answer")
+  await clock.advance(6000)
+  expect(w.tasks.length).toBe(2)
+  expect(w.tasks[1]!.command).toMatch(/^cat 'C:\/Temp2\/claude\/abc\/sid-test\/pi-subagents\/\d+-[a-z0-9]+\.md'$/)
+  expect(w.tasks[1]!.text).toContain("B's answer")
+})
+
+test('with only PowerShell it uses Get-Content; if the background command is refused it falls back, after the turn ends', async ($, on) => {
+  const w = fakeEngine(on)
+  const clock = mock.clock(on)
+  w.shell = 'PowerShell'
+  await $.session.start({ cwd: '/w', surface: 'desktop', isInteractive: true })
+  await $.tool.call({ tool: 'mcp__pi-subagents__spawn', task: 'A' } as never)
+  finish(w, ID, "A's answer")
+  await clock.advance(6000)
+  expect(w.tasks.length).toBe(1)
+  expect(w.tasks[0]!.command).toMatch(/^Get-Content -Raw -Encoding UTF8 -LiteralPath '/)
+  expect(w.tasks[0]!.text).toContain("A's answer")
+
+  // Refused while the main conversation is in a turn: kept until the turn ends, then sent as a plugin message
+  w.refuseTask = true
+  await $.tool.call({ tool: 'mcp__pi-subagents__spawn', task: 'B' } as never)
+  await $.turn.start({ turnId: 't1', text: '' } as never)
+  finish(w, ID2, "B's answer")
+  await clock.advance(6000)
+  expect(w.submitted.length).toBe(1)
+  expect(w.logs.some(l => l.includes('background-task notice failed'))).toBe(true)
+  await $.turn.complete({ turnId: 't1', answer: '', durationMs: 1, isAborted: false, reason: 'answer' } as never)
+  await clock.advance(3000)
+  expect(w.prompts.length).toBe(1)
+  expect(w.prompts[0]).toContain("B's answer")
+  expect(w.prompts[0]).toContain('not a user message')
 })

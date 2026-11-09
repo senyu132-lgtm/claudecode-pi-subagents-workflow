@@ -78,6 +78,16 @@ describe('broker', { concurrency: 8 }, () => {
     assert.equal(r.out, 'answer: count the rows');
   });
 
+  it('an id never starts with "-" or ".", so a name in another script still gives an id the CLI takes', async () => {
+    const h = home();
+    for (const [name, prefix] of [['验收-打断', 'pi-'], ['.审查', 'pi-'], ['a-审查', 'a-'], ['--x--', 'x-']]) {
+      const id = await start(h, 'count the rows', ['--name', name]);
+      assert.ok(id.startsWith(prefix), `${name} -> ${id}`);
+      const r = await pisub(h, ['wait', id, '--timeout', '60']);
+      assert.equal(r.code, 0, r.err);
+    }
+  });
+
   it('tool calls are counted for the transcript row: the last ones in live.json, the total in state.json', async () => {
     const h = home();
     const id = await start(h, '[slow 1500] count the rows');
@@ -155,7 +165,7 @@ describe('broker', { concurrency: 8 }, () => {
 
   it('messages sent while it works arrive in order (T22)', async () => {
     const h = home();
-    const id = await start(h, '[slow 4000] long task');
+    const id = await start(h, '[slow 10000] long task');
     await until(() => state(h, id).status === 'running' && view(h, id).includes('"k":"tool"'));
     for (const m of ['m1', 'm2', 'm3', 'm4', 'm5']) assert.equal((await pisub(h, ['send', id, m])).code, 0);
     const r = await pisub(h, ['wait', id, '--timeout', '60']);
@@ -206,9 +216,63 @@ describe('broker', { concurrency: 8 }, () => {
     assert.equal((await pisub(h, ['wait', id, '--timeout', '60'])).code, 0);
     // A lock that names a running process (this test runner) but has an old heartbeat
     fs.writeFileSync(path.join(runDir(h, id), 'serve.lock'), JSON.stringify({ pid: process.pid, at: Date.now() - 120000, token: 'other' }));
-    const r = await pisub(h, ['send', id, '--wait', '--timeout', '60', 'second']);
+    // A message queued the way a workflow's "resubmit in the right format" does it (send refuses a finished agent)
+    const inbox = path.join(runDir(h, id), 'inbox');
+    fs.mkdirSync(inbox, { recursive: true });
+    fs.writeFileSync(path.join(inbox, `${String(Date.now()).padStart(14, '0')}-000001-1.json`), JSON.stringify({ text: 'second', from: 'system', mode: 'steer', at: Date.now() }));
+    const r = await pisub(h, ['_serve', id]);
     assert.equal(r.code, 0, r.err);
-    assert.equal(r.out, 'answer: second');
+    assert.equal(state(h, id).rounds, 2);
+    assert.equal(final(h, id).trim(), 'answer: second');
+  });
+
+  it('an agent that has given its final answer is closed: send refuses it and queues nothing', async () => {
+    const h = home();
+    const id = await start(h, 'count the rows');
+    assert.equal((await pisub(h, ['wait', id, '--timeout', '60'])).code, 0);
+    const r = await pisub(h, ['send', id, 'and by region']);
+    assert.equal(r.code, 1);
+    assert.match(r.err, /finished and is closed; it takes no more messages/);
+    assert.equal(fs.existsSync(path.join(runDir(h, id), 'inbox')) ? fs.readdirSync(path.join(runDir(h, id), 'inbox')).length : 0, 0);
+    assert.equal(state(h, id).rounds, 1);
+  });
+
+  it('interrupt stops the current step at once and carries on with the new instruction in the same round', async () => {
+    const h = home();
+    const id = await start(h, '[slow 60000] count the rows');
+    await until(() => /"k":"tool"/.test(view(h, id)));
+    const t0 = Date.now();
+    const s = await pisub(h, ['send', id, '--mode', 'interrupt', 'use sales-2025.csv instead']);
+    assert.equal(s.code, 0, s.err);
+    assert.match(s.out, /an interrupt/);
+    const r = await pisub(h, ['wait', id, '--timeout', '60']);
+    assert.equal(r.code, 0, r.err);
+    assert.equal(r.out, 'answer: use sales-2025.csv instead');
+    assert.ok(Date.now() - t0 < 20000, 'did not wait for the 60 s tool call');
+    const st = state(h, id);
+    assert.equal(st.status, 'done');
+    assert.equal(st.rounds, 1);
+    const v = view(h, id);
+    assert.match(v, /"from":"claude","mode":"interrupt","text":"use sales-2025.csv instead"/);
+    assert.match(v, /Interrupted: stopping the current step/);
+    assert.doesNotMatch(v, /"k":"error"/);
+  });
+
+  it('an interrupt while waiting out an overload cuts the wait short and does not resume the old step', async () => {
+    const h = home({ overloadBackoffSec: [120] });
+    const id = await start(h, '[overload] count the rows');
+    await until(() => state(h, id).status === 'waiting');
+    const t0 = Date.now();
+    const s = await pisub(h, ['send', id, '--mode', 'interrupt', 'just say hi']);
+    assert.equal(s.code, 0, s.err);
+    const r = await pisub(h, ['wait', id, '--timeout', '60']);
+    assert.equal(r.code, 0, r.err);
+    assert.equal(r.out, 'answer: just say hi');
+    assert.ok(Date.now() - t0 < 20000, 'did not wait out the 120 s backoff');
+    // The old step was not resumed after the interrupt
+    await sleep(1000);
+    assert.doesNotMatch(view(h, id), /previous request was interrupted/);
+    assert.equal(state(h, id).rounds, 1);
   });
 
   it('maxAgents: a second agent waits for a free slot (P2-01)', async () => {

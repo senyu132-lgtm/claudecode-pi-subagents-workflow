@@ -6,7 +6,7 @@ description: Load before handing work to pi sub-agents (the pi coding agent runn
 # pi sub-agents
 
 pi (a lean coding agent that can run almost any model) is wrapped as background agents that behave much like Claude Code's native sub-agents:
-- they run in the background and you are notified automatically when they finish, with **only the final answer**;
+- they run in the background and you are notified automatically when they finish (as a background-task notice, like a finished background Bash command), with **only the final answer**;
 - their transcripts stay on disk, out of your context, until you ask for them;
 - you and the user can both add instructions mid-way.
 
@@ -24,14 +24,17 @@ Use them to save the user's Claude quota: you plan, split, review and decide; pi
 | Tool | What it does |
 |---|---|
 | `spawn` | Hand out a task; returns an id immediately. Params: `task` (required, self-contained), `model` (alias or provider/model), `name`, `cwd`, `readonly`, `thinking`, `isolation` (`'worktree'`: edits go to its own branch) |
-| `send` | Message an agent: while running it is a steer (`mode=follow_up` queues it after the current task); after it finished it resumes its previous session |
+| `send` | Message a running agent. `mode`: `steer` (default) arrives after the current step (one reply plus the tools it called), usually seconds to tens of seconds; `interrupt` stops the current step at once (a half-written reply or half-run command is dropped) and carries on with the new message in the same session, for when it is heading the wrong way; `follow_up` waits until the current task is done. A finished agent takes no more messages |
 | `status` | Status. `models=true` lists the model aliases the user configured |
 | `log` | Its transcript (only for debugging; it enters your context) |
 | `result` | Its final answer (only if a notification got lost) |
 | `stop` | Stop it |
 
-- Do not poll after spawning and do not watch it with `log`. A `[pi sub-agent notification]` arrives by itself.
-- Notifications are merged: results that land close together share one; while you are working they wait until your turn ends.
+- Do not poll after spawning and do not watch it with `log`. When it is done you get a background-task notice: `Background command "pi sub-agent <name> done" completed`. Read the output-file it names: it holds `[pi sub-agent results]` and each agent's `<pi-result>`. If you can't read it (a permission prompt), fetch the answer with `result` by id.
+- An agent is closed once it has given its final answer (`send` is refused). To carry on, `spawn` a new one and put the context it needs, and the old result, into the task.
+- That notice is a background command the plugin starts itself (it only prints the results file). You didn't start it and the user didn't say it.
+- Notifications are merged: results that land close together share one. While you are working, the engine queues it like any other background task.
+- Rarely (no Bash/PowerShell in the session, or the background command was refused) it falls back to a `[pi sub-agent notification, not a user message]` message with the same content.
 - `claude -p` (headless) exits at the end of the turn and never sees notifications. Use the CLI with `--wait` there.
 - The user can watch any agent live in the `/pi` pane and talk to it; their messages are labeled "You".
 
@@ -44,7 +47,7 @@ node "{{PISUB}}" spawn --model <alias> --cwd <dir> --task-file <instructions fil
 - Without `--wait`: prints the id right away; later use `pisub wait <id>` or `pisub result <id>`.
 - Other commands: `send`, `status`, `log`, `stop`, `models`, `accounts`, `apply <id>` (bring a worktree agent's branch into the user's files; `--check` first), `clean`, `help`.
 - Agents started from the CLI also show up under "Show all" in the `/pi` pane.
-- The script gets the result, so the plugin does not notify. Exception: if the user resumes a finished agent from the pane, it is adopted into this session and you are notified when it is done.
+- The script gets the result, so the plugin does not notify.
 
 ## Workflows (the user must type /pi flow first)
 - Off by default in every session. Only after the user types `/pi flow` in this session does the tool `mcp__pi-subagents__flow` exist (deferred; fetch it with ToolSearch).

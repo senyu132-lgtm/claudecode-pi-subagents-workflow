@@ -70,6 +70,8 @@ declare module 'claude-code' {
       detail: Shaped<Detail | null>
       notice: string
       sendCount: number
+      // How the pane's input box sends: true = interrupt
+      interrupt: boolean
       expanded: boolean
       flowOn: boolean
       activity: Shaped<Record<string, Activity>>

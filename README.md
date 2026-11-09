@@ -29,10 +29,10 @@ So this plugin splits the work. Claude keeps the parts that need its judgment: p
 
 ## What it does
 
-- **Claude only gets the result.** Claude starts an agent with `spawn` and keeps working. When the agent finishes, Claude gets one message with its final answer. Everything in between (tool calls, file reads, reasoning) stays on disk, so Claude's context doesn't fill up with it and the main conversation lasts longer.
+- **Claude only gets the result.** Claude starts an agent with `spawn` and keeps working. When the agent finishes, Claude is told the way it is told about a finished background command, and reads the final answer from there. The notice never shows up in the conversation as if you had typed it. Everything in between (tool calls, file reads, reasoning) stays on disk, so Claude's context doesn't fill up with it and the main conversation lasts longer.
 - **Workflows.** After you type `/pi flow`, Claude can write a short script that runs many agents. The script format follows Claude Code's own Workflow scripts (`agent`, `pipeline`, `parallel`, `phase`), and adds a few things: answers can be checked against a JSON Schema (the agent is asked to redo it if they don't match), `sh()` runs your own check scripts, each model gets its own concurrency limit, and a re-run reuses the results of steps that didn't change.
 - **They look like native sub-agents.** In the conversation, an agent shows up the way Claude Code's own sub-agents do: `● pi(task) strong`, its latest tool calls under it while it runs, then one line such as `Done (8 tool uses · 1m 12s)`. A workflow shows its phase and the agents running in it. The result message is one line per agent (ctrl+o shows the full text). This only changes what you see: Claude reads exactly the same text, so it costs no extra Claude quota.
-- **You can watch and talk to them.** `/pi` (or **view** on an agent's row) opens a panel with all the agents. Click one to follow its work, drawn like the main conversation. Type into it to give it extra instructions, or to make a finished agent continue.
+- **You can watch and talk to them.** `/pi` (or **view** on an agent's row) opens a panel with all the agents. Click one to follow its work, drawn like the main conversation. While it runs, type into it to give it extra instructions, or switch the box to **interrupt now** to stop its current step and have it take your message at once. An agent that has given its final answer is closed.
 - **Any model, mixed in one job.** Give your models short names in a config file, for example `brain` for a strong one and `worker` for a cheap one, and use both in the same workflow.
 - **Edits can stay off your files.** With `isolation: 'worktree'` (`--worktree` on the CLI) an agent works in its own git worktree, on a branch of its own. You look at the diff and bring it in with `pisub apply <id>` when you're happy with it, and agents working in parallel can't overwrite each other.
 - **It keeps going.** Every agent runs in its own background process, so it isn't killed when Claude Code restarts. If a provider says you've hit your usage limit, the agent can switch to another account and continue where it stopped. Rate limits and overloads are retried with increasing waits.
@@ -105,7 +105,8 @@ Without a config file, pi uses its own default model (the one you last picked in
 - By default it lists the agents started in this session. **Show all** also shows agents from other sessions and from the command line.
 - Click an agent to see its live output in the style of the main conversation: `> prompt`, `● Bash(…)` with `⎿ output` under it, errors in red, and what it's typing right now.
 - While agents of this session are running, a line above the prompt says how many; click it to open the panel.
-- Type in the box at the bottom. While the agent is running, your message is passed to it after its current step. If it has finished, it continues the same conversation, and Claude gets the new result when it's done.
+- The box at the bottom is there while the agent runs. By default your message is passed to it after its current step (**steer**). Click the mode button to switch to **interrupt now**: the current step (a long tool call, or a wait after an overload) is stopped and the agent carries on with your message right away.
+- Once an agent has given its final answer it is closed and takes no more messages. To follow up, Claude starts a new agent.
 - **stop** stops it. For a workflow, the panel lists the agents by phase (the phase in progress open, finished ones folded into one line) and its log below; click an agent to open it.
 
 **Workflows are off until you turn them on.** Type `/pi flow` in a session to allow them there, and `/pi flow off` to turn them off. This is on purpose: a workflow can start dozens of agents, so it only happens when you've said yes. The setting is remembered if you resume the session later.
@@ -235,7 +236,7 @@ pisub spawn --model worker --cwd . --task-file task.md --wait   # run an agent a
 pisub spawn --model brain "Review src/auth.ts for bugs"          # start it and print its id right away
 pisub status                                                     # list agents
 pisub log <id>                                                   # what it did
-pisub send <id> "also cover the edge cases"                      # add instructions, or make a finished agent continue
+pisub send <id> "also cover the edge cases"                      # add instructions to a running agent (--mode interrupt: stop its current step first)
 pisub wait <id>                                                  # wait for it and print the answer
 pisub stop <id>
 pisub models                                                     # your aliases (--pi lists every model pi knows)
@@ -272,7 +273,7 @@ The plugin has no server of its own. Your code and prompts go only to the model 
 
 **`sh()` fails on Windows.** String commands need bash, which comes with Git for Windows. If it's installed somewhere unusual, set `PISUB_BASH` to the full path of `bash.exe`. Or pass an array, `sh(['python', 'check.py'])`, which doesn't need a shell.
 
-**An agent shows as an error after a reboot or a crash.** If its background process dies, the agent is marked as failed about 15 seconds later, with a final answer saying so, and Claude is told. If messages were still waiting for it, a new background process starts and delivers them instead. Send it a message and it continues from its saved session.
+**An agent shows as an error after a reboot or a crash.** If its background process dies, the agent is marked as failed about 15 seconds later, with a final answer saying so, and Claude is told. If messages were still waiting for it, a new background process starts and delivers them instead. To redo the work, start a new agent; the old one's log and session stay on disk.
 
 **An agent was stopped as hung.** pi didn't answer a command within `rpcTimeoutSec`, sent nothing for `stallTimeoutMin` minutes, or a tool call ran past `toolTimeoutMin`. If your tasks really take that long, raise those settings.
 

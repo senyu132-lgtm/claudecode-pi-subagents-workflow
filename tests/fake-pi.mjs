@@ -6,6 +6,7 @@
 //   [reject]          the prompt is turned down (success: false)
 //   [handled]         the prompt is consumed without a run (disposition "handled")
 //   [slow N]          the run calls a tool that takes N ms (an abort ends it early)
+//   [overload]        the run ends with an "overloaded" error (the broker backs off and retries)
 //   [write F TEXT]    the run writes TEXT into file F of its working directory
 //   [empty]           the final answer has no text
 //   [silent]          the run starts and then sends nothing
@@ -14,6 +15,8 @@
 //   [bigline]         prints 65 MB without a line break
 //   [exit]            the process dies in the middle of the run
 // The answer is "answer: <prompt without markers>", plus "| steers: a,b" for messages steered in while it ran.
+// Like pi, `abort` is answered once the run has stopped (right away for runs that never stop: [silent] and co.),
+// and a prompt with streamingBehavior while a run is going is queued like a steer instead of turned down.
 //
 // Environment:
 //   FAKE_PI=hang-state      never answers get_state
@@ -42,6 +45,14 @@ const fail = (req, error) => send({ type: 'response', id: req.id, command: req.t
 
 let running = false;
 let aborted = false;
+let abortable = false; // the current run reacts to an abort (and then settles)
+let settleWaiters = []; // abort requests to answer once the run has settled
+function settled(rec) {
+  running = false;
+  abortable = false;
+  send(rec);
+  for (const f of settleWaiters.splice(0)) f();
+}
 let steers = [];
 let lastText = '';
 let hungOnce = false;
@@ -49,6 +60,7 @@ let hungOnce = false;
 async function run(message) {
   running = true;
   aborted = false;
+  abortable = false;
   steers = [];
   send({ type: 'agent_start' });
   send({ type: 'message_end', message: { role: 'user', content: [{ type: 'text', text: message }] } });
@@ -70,6 +82,12 @@ async function run(message) {
     for (let i = 0; i < 65; i++) await new Promise(r => process.stdout.write(chunk, r));
     return;
   }
+  abortable = true;
+  if (message.includes('[overload]')) {
+    await sleep(50);
+    send({ type: 'message_end', message: { role: 'assistant', content: [], stopReason: 'error', errorMessage: '529 overloaded_error: Overloaded (test)' } });
+    return settled({ type: 'agent_settled' });
+  }
   const slow = /\[slow (\d+)\]/.exec(message);
   if (slow) {
     send({ type: 'tool_execution_start', toolName: 'bash', args: { command: `sleep ${slow[1]}` } });
@@ -81,15 +99,12 @@ async function run(message) {
   if (write) fs.writeFileSync(path.join(process.cwd(), write[1]), write[2]);
   if (aborted) {
     send({ type: 'message_end', message: { role: 'assistant', content: [], stopReason: 'aborted' } });
-    running = false;
-    send({ type: 'agent_settled', aborted: true });
-    return;
+    return settled({ type: 'agent_settled', aborted: true });
   }
   const clean = message.replace(/\[[^\]]*\]\s*/g, '').trim();
   lastText = message.includes('[empty]') ? '' : `answer: ${clean}${steers.length ? ` | steers: ${steers.join(',')}` : ''}`;
   send({ type: 'message_end', message: { role: 'assistant', content: lastText ? [{ type: 'text', text: lastText }] : [], stopReason: 'stop' } });
-  running = false;
-  send({ type: 'agent_settled' });
+  settled({ type: 'agent_settled' });
 }
 
 const rl = readline.createInterface({ input: process.stdin });
@@ -111,7 +126,11 @@ rl.on('line', line => {
         fs.writeFileSync(once, String(process.pid));
         return; // never answered: the broker is killed while waiting
       }
-      if (running) return fail(req, 'already running');
+      if (running) {
+        if (!req.streamingBehavior) return fail(req, 'already running');
+        steers.push(req.message);
+        return ok(req, { disposition: 'queued' });
+      }
       if (req.message.includes('[reject]')) return fail(req, 'rejected (test)');
       if (req.message.includes('[handled]')) return ok(req, { disposition: 'handled' });
       ok(req, { disposition: 'started' });
@@ -125,6 +144,7 @@ rl.on('line', line => {
       return ok(req);
     case 'abort':
       aborted = true;
+      if (running && abortable) return void settleWaiters.push(() => ok(req));
       return ok(req);
     case 'clear_queue':
     case 'set_model':
