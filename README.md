@@ -351,6 +351,7 @@ flowchart LR
 
 - Made by [senyu132-lgtm](https://github.com/senyu132-lgtm) with [Claude Code](https://claude.com/claude-code) running Claude Opus 5.5.
 - Built on [pi](https://www.npmjs.com/package/@earendil-works/pi-coding-agent).
+- Thanks to the [LINUX DO](https://linux.do) community for the support and feedback.
 - Not affiliated with Anthropic or the pi project.
 
 ## License

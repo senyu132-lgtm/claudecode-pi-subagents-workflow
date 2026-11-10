@@ -351,6 +351,7 @@ flowchart LR
 
 - 由 [senyu132-lgtm](https://github.com/senyu132-lgtm) 用 [Claude Code](https://claude.com/claude-code)（模型 Claude Opus 5.5）制作。
 - 基于 [pi](https://www.npmjs.com/package/@earendil-works/pi-coding-agent)。
+- 感谢 [LINUX DO](https://linux.do) 社区的支持与反馈。
 - 和 Anthropic、pi 项目都没有关系。
 
 ## 许可证
